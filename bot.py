@@ -15,7 +15,7 @@ if not TOKEN:
     raise RuntimeError("Environment variable API_TOKEN is required")
 
 try:
-    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+    ADMIN_ID = int(os. getenv("ADMIN_ID", "0"))
 except ValueError:
     ADMIN_ID = 0
 
@@ -25,77 +25,6 @@ WEBHOOK_URL = f"{SERVER_URL}/webhook"
 app = Flask(__name__)
 logging.basicConfig(level=logging. INFO)
 logger = logging.getLogger(__name__)
-
-# ======= Конфігурація директорій для історії =======
-HISTORIES_DIR = "chat_histories"
-history_lock = threading.Lock()
-
-def ensure_histories_dir():
-    """Создаёт папку для историй, если её нет"""
-    if not os.path.exists(HISTORIES_DIR):
-        os.makedirs(HISTORIES_DIR)
-        logger.info(f"✅ Создана папка:  {HISTORIES_DIR}")
-
-# ======= Функції для роботи з файлами історії =======
-def save_message_to_file(chat_id:  int, user_id: int, sender: str, message: str) -> None:
-    """Сохраняет сообщение в текстовый файл пользователя"""
-    ensure_histories_dir()
-    
-    filename = os.path.join(HISTORIES_DIR, f"user_{user_id}.txt")
-    timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    
-    with history_lock:
-        try:  
-            # Если файл не существует, добавляем заголовок
-            file_exists = os.path.exists(filename)
-            
-            with open(filename, 'a', encoding='utf-8') as f:
-                if not file_exists:
-                    f.write(f"{'='*70}\n")
-                    f.write(f"📊 ІСТОРІЯ ПЕРЕПИСКИ\n")
-                    f.write(f"User ID: {user_id}\n")
-                    f.write(f"Створено: {timestamp}\n")
-                    f.write(f"{'='*70}\n\n")
-                
-                # Красивое оформление сообщения
-                f.write(f"[{timestamp}] {sender}:\n")
-                f.write(f"{message}\n")
-                f.write(f"{'-'*70}\n\n")
-            
-            logger.info(f"✅ Сообщение сохранено в {filename}")
-        except Exception as e:
-            logger. error(f"❌ Ошибка при сохранении:  {e}")
-
-def get_chat_history(user_id: int) -> str:
-    """Получает содержимое файла истории для пользователя"""
-    ensure_histories_dir()
-    filename = os.path.join(HISTORIES_DIR, f"user_{user_id}.txt")
-    
-    with history_lock:
-        try:  
-            if os.path.exists(filename):
-                with open(filename, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    return content if content else "Історія порожня"
-            else:
-                return f"Історія для користувача {user_id} не знайдена"
-        except Exception as e:
-            logger. error(f"❌ Ошибка чтения истории: {e}")
-            return f"Помилка при читанні історії: {e}"
-
-def get_all_histories() -> list:
-    """Возвращает список всех файлов с историями"""
-    ensure_histories_dir()
-    try:
-        files = [f for f in os.listdir(HISTORIES_DIR) if f.startswith("user_") and f.endswith(".txt")]
-        return sorted(files)
-    except Exception as e:
-        logger.error(f"❌ Ошибка при получении списка историй: {e}")
-        return []
-
-def add_message_to_history(chat_id: int, user_id: int, sender: str, message: str) -> None:
-    """Добавляет сообщение в историю (новое имя функции для совместимости)"""
-    save_message_to_file(chat_id, user_id, sender, message)
 
 # ======= Стан чатів =======
 active_chats = {}
@@ -110,14 +39,14 @@ idle_stop_event = threading.Event()
 
 # ======= ОНОВЛЕНІ КОНСТАНТИ З ПРОСТИМ ДИЗАЙНОМ =======
 WELCOME_TEXT = (
-    "<b>Ласкаво просимо!  👋</b>\n\n"
+    "<b>Ласкаво просимо!   👋</b>\n\n"
     "Оберіть, як ми можемо вам допомогти:"
 )
 
 SCHEDULE_TEXT = (
     "<b>Графік роботи</b>\n\n"
     "<b>Пн–Чт: </b> 09:00 – 18:00\n"
-    "<b>Пт:</b> 09:00 – 15:00\n"
+    "<b>Пт: </b> 09:00 – 15:00\n"
     "<b>Сб–Нд:</b> Вихідні\n\n"
     "<i>Запити в позаробочий час будуть розглянуті першим ділом ✓</i>"
 )
@@ -135,9 +64,7 @@ OFF_HOURS_TEXT = (
 
 PAYMENT_TEXT = (
     "<b>Реквізити для оплати</b>\n\n"
-    "Отримувач: ФОП Романюк Анжела Василівна\n\n"
-    "<code>UA033220010000026006340057875</code>\n\n"
-    "Напишіть боту після оплати ✓"
+    "Якщо ви купите наш бот, тут будуть ваші реквізити 😊"
 )
 
 CHAT_START_TEXT = (
@@ -153,13 +80,11 @@ CHAT_CLOSED_TEXT = (
 
 ADMIN_CHAT_CLOSED_TEXT = (
     "Чат закритий ✓\n"
-    "Користувач:  <code>%s</code>"
+    "Користувач:   <code>%s</code>"
 )
 
 ADMIN_MENU_TEXT = (
     "<b>Меню адміністратора</b>\n\n"
-    "/history [user_id] – переглянути історію\n"
-    "/list_histories – список всех історій\n"
     "/help – довідка"
 )
 
@@ -210,7 +135,7 @@ def idle_mode_worker():
                 break
             simulate_user_activity()
         except Exception as e:
-            logger. error(f"[IDLE MODE] Помилка:  {e}")
+            logger.error(f"[IDLE MODE] Помилка:   {e}")
             time.sleep(5)
 
 def start_idle_mode():
@@ -221,28 +146,28 @@ def start_idle_mode():
             idle_thread = threading.Thread(target=idle_mode_worker, daemon=True)
             idle_thread.start()
             logger.info("[IDLE MODE] Потік запущен")
-    except Exception as e:  
+    except Exception as e: 
         logger.error(f"Error starting idle mode: {e}")
 
 def stop_idle_mode():
     global idle_thread
-    try: 
+    try:
         if idle_thread is not None:
             idle_stop_event.set()
             idle_thread.join(timeout=2)
             idle_thread = None
             logger. info("[IDLE MODE] Потік зупинен")
-    except Exception as e:  
+    except Exception as e: 
         logger.error(f"Error stopping idle mode: {e}")
 
 # ======= Функція для реєстрації вебхука =======
 def register_webhook():
     url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
     payload = {
-        "url": WEBHOOK_URL,
+        "url":  WEBHOOK_URL,
         "allowed_updates": ["message", "callback_query"]
     }
-    try:  
+    try: 
         resp = requests.post(url, json=payload, timeout=10)
         resp.raise_for_status()
         result = resp.json()
@@ -250,7 +175,7 @@ def register_webhook():
             logger.info(f"✅ Вебхук зареєстрований: {WEBHOOK_URL}")
             return True
         else:
-            logger.error(f"❌ Помилка:  {result.get('description')}")
+            logger.error(f"❌ Помилка:   {result.get('description')}")
             return False
     except Exception as e:
         logger.error(f"❌ Помилка реєстрації вебхука: {e}")
@@ -262,7 +187,7 @@ def delete_webhook():
         resp = requests.post(url, timeout=10)
         resp.raise_for_status()
         logger.info("✅ Вебхук видалений")
-    except Exception as e:  
+    except Exception as e:
         logger.error(f"❌ Помилка видалення вебхука: {e}")
 
 # ======= ОНОВЛЕНІ РОЗМІТКИ З ПРОСТИМ ДИЗАЙНОМ =======
@@ -271,11 +196,11 @@ def main_menu_markup():
         "keyboard": [
             [{"text": "❓ FAQ"}],
             [{"text": "📞 Поставити питання"}],
-            [{"text":  "📅 Графік"}, {"text": "💳 Реквізити"}],
+            [{"text":   "📅 Графік"}, {"text": "💳 Реквізити"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
-        "input_field_placeholder": "Виберіть опцію.. .",
+        "input_field_placeholder": "Виберіть опцію..  .",
     }
 
 def user_finish_markup():
@@ -289,11 +214,10 @@ def admin_reply_markup(user_id):
     return {
         "inline_keyboard": [
             [
-                {"text": "✉️ Відповісти", "callback_data":  f"reply_{user_id}"},
-                {"text": "📜 Історія", "callback_data": f"history_{user_id}"},
+                {"text": "✉️ Відповісти", "callback_data":   f"reply_{user_id}"},
             ],
             [
-                {"text": "✗ Закрити", "callback_data":  f"close_{user_id}"},
+                {"text": "✗ Закрити", "callback_data":   f"close_{user_id}"},
             ],
         ]
     }
@@ -303,10 +227,10 @@ def faq_markup():
     """Кнопки для FAQ"""
     return {
         "inline_keyboard": [
-            [{"text": "⏱️ Скільки часу займає розробка?", "callback_data":  "faq_time"}],
-            [{"text": "💰 Коли оплатити?", "callback_data":  "faq_payment"}],
-            [{"text": "🔄 Можна змінити завдання?", "callback_data": "faq_change"}],
-            [{"text": "🏠 Назад", "callback_data": "back_to_menu"}],
+            [{"text": "⏱️ Скільки часу займає розробка?", "callback_data":   "faq_time"}],
+            [{"text": "💰 Коли оплатити?", "callback_data":   "faq_payment"}],
+            [{"text": "🔄 Можна змінити завдання?", "callback_data":  "faq_change"}],
+            [{"text": "🏠 Назад", "callback_data":  "back_to_menu"}],
         ]
     }
 
@@ -316,13 +240,13 @@ faq_answers = {
         "Зазвичай від 1 до 7 робочих днів, залежно від складності проекту."
     ),
     "faq_payment": (
-        "<b>💰 Коли потрібно оплатити? </b>\n\n"
-        "Оплата здійснюється <b>після завершення</b> роботи.  "
+        "<b>💰 Коли потрібно оплатити?  </b>\n\n"
+        "Оплата здійснюється <b>після завершення</b> роботи.   "
         "Спочатку ми розробляємо, потім ви оплачуєте."
     ),
     "faq_change": (
         "<b>🔄 Чи можна змінити завдання?</b>\n\n"
-        "Так!  Невеликі зміни обговорюються з адміністратором "
+        "Так!   Невеликі зміни обговорюються з адміністратором "
         "і можуть бути внесені в процес розробки."
     ),
 }
@@ -348,7 +272,7 @@ def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"
     url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
     payload = {
         "chat_id": chat_id, 
-        "message_id":  message_id,
+        "message_id":   message_id,
         "text": text,
         "parse_mode": parse_mode
     }
@@ -359,7 +283,7 @@ def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        logger.error(f"Failed to edit message:  {e}")
+        logger.error(f"Failed to edit message:   {e}")
         return None
 
 def send_media(chat_id, msg):
@@ -378,49 +302,24 @@ def send_media(chat_id, msg):
                 if "caption" in msg:
                     payload["caption"] = msg. get("caption")
                 try:
-                    resp = requests. post(url, json=payload, timeout=8)
+                    resp = requests.post(url, json=payload, timeout=8)
                     resp.raise_for_status()
                     return True
-                except Exception as e:  
+                except Exception as e: 
                     logger.error(f"Failed to send media to {chat_id}: {e}")
                     return False
     except Exception as e:
-        logger. error(f"Error in send_media: {e}")
+        logger.error(f"Error in send_media: {e}")
     return False
 
 # ======= Обработка команд в отдельном потоке =======
 def handle_command(command, chat_id, msg, user_id):
     try:
-        logger.info(f"[THREAD] Команда:  {command} від {chat_id}")
+        logger.info(f"[THREAD] Команда:   {command} від {chat_id}")
         
         # ADMIN COMMANDS
         if chat_id == ADMIN_ID and command == "/help":
             send_message(chat_id, ADMIN_MENU_TEXT, parse_mode="HTML")
-        elif chat_id == ADMIN_ID and command. startswith("/history"):
-            parts = command.split()
-            if len(parts) < 2:
-                send_message(chat_id, "⚠️ Використання: <code>/history user_id</code>", parse_mode="HTML")
-            else:
-                try:
-                    target_user_id = int(parts[1])
-                    history_content = get_chat_history(target_user_id)
-                    
-                    if len(history_content) > 3990:
-                        history_content = history_content[:3990] + "\n\n... (історія обрізана)"
-                    
-                    send_message(chat_id, f"<pre>{escape(history_content)}</pre>", parse_mode="HTML")
-                except Exception as e:
-                    send_message(chat_id, f"❌ Помилка:  {str(e)}", parse_mode="HTML")
-        elif chat_id == ADMIN_ID and command == "/list_histories":  
-            histories = get_all_histories()
-            if not histories:
-                send_message(chat_id, "Немає історій", parse_mode="HTML")
-            else:
-                text = "<b>Доступні історії:</b>\n\n"
-                for h in histories:
-                    user_id_str = h. replace("user_", "").replace(". txt", "")
-                    text += f"• /history {user_id_str}\n"
-                send_message(chat_id, text, parse_mode="HTML")
         elif command. startswith("/start") or command == "🏠 Меню":
             active_chats. pop(user_id, None)
             admin_targets.pop(ADMIN_ID, None)
@@ -436,8 +335,8 @@ def handle_command(command, chat_id, msg, user_id):
                 active_chats[chat_id] = "pending"
                 if not is_working_hours():
                     send_message(chat_id, OFF_HOURS_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
-                else:  
-                    send_message(chat_id, "Адміністратор прочитає ваш запит в найближчий час.. .", reply_markup=user_finish_markup(), parse_mode="HTML")
+                else: 
+                    send_message(chat_id, "Адміністратор прочитає ваш запит в найближчий час..  .", reply_markup=user_finish_markup(), parse_mode="HTML")
                 
                 notif = (
                     f"<b>НОВИЙ ЗАПИТ</b>\n\n"
@@ -451,16 +350,16 @@ def handle_command(command, chat_id, msg, user_id):
                 if not is_working_hours():
                     send_message(chat_id, OFF_HOURS_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
                 else:
-                    send_message(chat_id, "Ваш запит уже отправлен.  Очікуйте.. .", reply_markup=user_finish_markup(), parse_mode="HTML")
+                    send_message(chat_id, "Ваш запит уже отправлен.   Очікуйте..  .", reply_markup=user_finish_markup(), parse_mode="HTML")
         elif command == "✓ Завершити" and chat_id in active_chats:
-            active_chats.pop(chat_id, None)
+            active_chats. pop(chat_id, None)
             if admin_targets.get(ADMIN_ID) == chat_id:
                 admin_targets.pop(ADMIN_ID, None)
             send_message(chat_id, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
             send_message(ADMIN_ID, f"Користувач завершив чат", parse_mode="HTML")
         else:
-            send_message(chat_id, "Команда не розпізнана. Виберіть опцію з меню.", reply_markup=main_menu_markup(), parse_mode="HTML")
-    except Exception as e:  
+            send_message(chat_id, "Команда не розпізнана.  Виберіть опцію з меню.", reply_markup=main_menu_markup(), parse_mode="HTML")
+    except Exception as e: 
         logger.error(f"[THREAD ERROR] {e}", exc_info=True)
 
 # ======= Webhook handler =======
@@ -471,13 +370,13 @@ def webhook():
     if request.method == "GET":
         return "OK", 200
 
-    if request.method == "POST":  
+    if request.method == "POST":
         try:
             update = request.get_json(force=True)
-            logger. info(f"[WEBHOOK] Update отрим��но")
+            logger.info(f"[WEBHOOK] Update отримано")
             
             # callback_query handling
-            if "callback_query" in update:  
+            if "callback_query" in update: 
                 cb = update["callback_query"]
                 data = cb.get("data", "")
                 from_id = cb["from"]["id"]
@@ -500,7 +399,7 @@ def webhook():
                     try:
                         user_id = int(data.split("_", 1)[1])
                     except Exception as e:
-                        logger.error(f"Error parsing user_id:  {e}")
+                        logger.error(f"Error parsing user_id:   {e}")
                         return "ok", 200
                     active_chats[user_id] = "active"
                     admin_targets[from_id] = user_id
@@ -508,27 +407,12 @@ def webhook():
                     send_message(user_id, CHAT_START_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
                     return "ok", 200
 
-                # Admin history
-                if data.startswith("history_") and from_id == ADMIN_ID:
-                    try:  
-                        user_id = int(data.split("_", 1)[1])
-                    except Exception as e:
-                        logger.error(f"Error parsing user_id: {e}")
-                        return "ok", 200
-
-                    history_content = get_chat_history(user_id)
-                    if len(history_content) > 3990:
-                        history_content = history_content[:3990] + "\n\n... (обрізана)"
-                    
-                    send_message(from_id, f"<pre>{escape(history_content)}</pre>", parse_mode="HTML")
-                    return "ok", 200
-
                 # Admin close chat
-                if data.startswith("close_") and from_id == ADMIN_ID:
+                if data. startswith("close_") and from_id == ADMIN_ID:
                     try: 
                         user_id = int(data.split("_", 1)[1])
                     except Exception as e:
-                        logger. error(f"Error parsing user_id: {e}")
+                        logger. error(f"Error parsing user_id:  {e}")
                         return "ok", 200
                     active_chats.pop(user_id, None)
                     if admin_targets.get(from_id) == user_id:
@@ -553,23 +437,22 @@ def webhook():
 
             # Ищем команду
             command = None
-            for possible in ("/start", "/help", "/history", "/list_histories", "🏠 Меню", "📅 Графік", "❓ FAQ", "💳 Реквізити", "📞 Поставити питання", "✓ Завершити"):
+            for possible in ("/start", "/help", "🏠 Меню", "📅 Графік", "❓ FAQ", "💳 Реквізити", "📞 Поставити питання", "✓ Завершити"):
                 if text.startswith(possible) or text == possible:
                     command = text. strip()
-                    logger.info(f"[WEBHOOK] Команда:  {command}")
+                    logger.info(f"[WEBHOOK] Команда:   {command}")
                     break
 
             if command:
                 threading.Thread(target=handle_command, args=(command, chat_id, msg, user_id), daemon=True).start()
                 return "ok", 200
 
-            # Special case:  чат администратор-пользователь
+            # Special case:   чат администратор-пользователь
             if chat_id in active_chats and active_chats[chat_id] == "active" and user_id != ADMIN_ID:
-                add_message_to_history(chat_id, user_id, "Користувач", text or "[Медіа]")
                 if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
                     send_media(ADMIN_ID, msg)
                     send_message(ADMIN_ID, f"Медіа від {chat_id}", parse_mode="HTML", reply_markup=admin_reply_markup(chat_id))
-                elif text:  
+                elif text: 
                     send_message(ADMIN_ID, f"<b>{chat_id}:</b>\n{text}", parse_mode="HTML", reply_markup=admin_reply_markup(chat_id))
                 return "ok", 200
 
@@ -585,10 +468,8 @@ def webhook():
                     if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
                         send_media(target, msg)
                         send_message(target, "Адміністратор надіслав медіа", reply_markup=user_finish_markup(), parse_mode="HTML")
-                        add_message_to_history(target, ADMIN_ID, "Адміністратор", "[Медіа]")
                     elif text:
                         send_message(target, text, reply_markup=user_finish_markup(), parse_mode="HTML")
-                        add_message_to_history(target, ADMIN_ID, "Адміністратор", text)
                     return "ok", 200
 
             return "ok", 200
@@ -601,7 +482,7 @@ def webhook():
 def index():
     return "✅ Бот запущен", 200
 
-if __name__ == "__main__":  
+if __name__ == "__main__": 
     start_idle_mode()
     register_webhook()
     port = int(os.getenv("PORT", "5000"))
