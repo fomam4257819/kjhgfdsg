@@ -23,7 +23,12 @@ SERVER_URL = os.getenv("SERVER_URL", "http://localhost:5000")
 WEBHOOK_URL = f"{SERVER_URL}/webhook"
 
 app = Flask(__name__)
-logging.basicConfig(level=logging. INFO)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 logger = logging.getLogger(__name__)
 
 # ======= Стан чатів =======
@@ -32,10 +37,12 @@ admin_targets = {}
 
 # ======= Idle mode =======
 idle_mode_enabled = True
-idle_min_interval = 60
-idle_max_interval = 600
+# Интервал симуляции действий — 4-8 минут (240-480 секунд)
+idle_min_interval = 240
+idle_max_interval = 480
 idle_thread = None
 idle_stop_event = threading.Event()
+idle_counter = 0  # Счётчик симуляций
 
 # ======= ОНОВЛЕНІ КОНСТАНТИ З ПРОСТИМ ДИЗАЙНОМ =======
 WELCOME_TEXT = (
@@ -109,6 +116,7 @@ def is_working_hours():
 
 # ======= Функції для холостого ходу =======
 def simulate_user_activity():
+    global idle_counter
     try:
         activity_log = [
             "Користувач натиснув кнопку",
@@ -116,8 +124,17 @@ def simulate_user_activity():
             "Користувач читає FAQ",
         ]
         activity = random.choice(activity_log)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"[IDLE MODE] {timestamp} → {activity}")
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        idle_counter += 1
+        out = (
+            f"\n----- SIMULATION #{idle_counter} -----\n"
+            f"Симуляція дії користувача в {timestamp}\n"
+            f"Дія: {activity}\n"
+            f"------------------------------"
+        )
+        print(out)
+        logger.info(f"[IDLE MODE] #{idle_counter}: {timestamp} → {activity}")
     except Exception as e:
         logger.error(f"Error in simulate_user_activity: {e}")
 
@@ -126,11 +143,12 @@ def idle_mode_worker():
     while not idle_stop_event.is_set():
         try:
             wait_time = random.randint(idle_min_interval, idle_max_interval)
+            logger.info(f"[IDLE MODE] Очікування {wait_time//60} хвилин ({wait_time} с) до наступної симуляції...")
             if idle_stop_event.wait(timeout=wait_time):
                 break
             simulate_user_activity()
         except Exception as e:
-            logger. error(f"[IDLE MODE] Помилка:    {e}")
+            logger.error(f"[IDLE MODE] Помилка:    {e}")
             time.sleep(5)
 
 def start_idle_mode():
@@ -151,7 +169,7 @@ def stop_idle_mode():
             idle_stop_event.set()
             idle_thread.join(timeout=2)
             idle_thread = None
-            logger. info("[IDLE MODE] Потік зупинен")
+            logger.info("[IDLE MODE] Потік зупинен")
     except Exception as e:  
         logger.error(f"Error stopping idle mode: {e}")
 
@@ -195,7 +213,7 @@ def main_menu_markup():
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
-        "input_field_placeholder": "Виберіть опцію..   .",
+        "input_field_placeholder": "Виберіть опцію...",
     }
 
 def user_finish_markup():
@@ -263,9 +281,9 @@ def send_message(chat_id, text, reply_markup=None, parse_mode=None):
     if parse_mode is not None:
         payload["parse_mode"] = parse_mode
     try:
-        resp = requests. post(url, json=payload, timeout=8)
+        resp = requests.post(url, json=payload, timeout=8)
         resp.raise_for_status()
-        return resp. json()
+        return resp.json()
     except Exception as e:
         logger.error(f"Failed to send message to {chat_id}: {e}")
         return None
@@ -274,7 +292,7 @@ def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"
     """Редактирует сообщение (для кнопок FAQ)"""
     url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
     payload = {
-        "chat_id": chat_id, 
+        "chat_id": chat_id,
         "message_id":    message_id,
         "text": text,
         "parse_mode": parse_mode
@@ -303,7 +321,7 @@ def send_media(chat_id, msg):
                 url = f"https://api.telegram.org/bot{TOKEN}/{api}"
                 payload = {"chat_id": chat_id, key: file_id}
                 if "caption" in msg:
-                    payload["caption"] = msg. get("caption")
+                    payload["caption"] = msg.get("caption")
                 try:
                     resp = requests.post(url, json=payload, timeout=8)
                     resp.raise_for_status()
@@ -319,12 +337,11 @@ def send_media(chat_id, msg):
 def handle_command(command, chat_id, msg, user_id):
     try:
         logger.info(f"[THREAD] Команда:    {command} від {chat_id}")
-        
         # ADMIN COMMANDS
         if chat_id == ADMIN_ID and command == "/help":
-            send_message(chat_id, ADMIN_MENU_TEXT, parse_mode="HTML")
-        elif command. startswith("/start") or command == "🏠 Меню":
-            active_chats. pop(user_id, None)
+            send_message(chat_id, WELCOME_TEXT, parse_mode="HTML")
+        elif command.startswith("/start") or command == "🏠 Меню":
+            active_chats.pop(user_id, None)
             admin_targets.pop(ADMIN_ID, None)
             send_message(chat_id, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
         elif command == "📅 Графік":
@@ -339,8 +356,7 @@ def handle_command(command, chat_id, msg, user_id):
                 if not is_working_hours():
                     send_message(chat_id, OFF_HOURS_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
                 else:  
-                    send_message(chat_id, "Адміністратор прочитає ваш запит в найближчий час..   .", reply_markup=user_finish_markup(), parse_mode="HTML")
-                
+                    send_message(chat_id, "Адміністратор прочитає ваш запит в найближчий час...", reply_markup=user_finish_markup(), parse_mode="HTML")
                 notif = (
                     f"<b>НОВИЙ ЗАПИТ</b>\n\n"
                     f"User ID: <code>{chat_id}</code>\n"
@@ -353,9 +369,9 @@ def handle_command(command, chat_id, msg, user_id):
                 if not is_working_hours():
                     send_message(chat_id, OFF_HOURS_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
                 else:
-                    send_message(chat_id, "Ваш запит уже отправлен.    Очікуйте..   .", reply_markup=user_finish_markup(), parse_mode="HTML")
+                    send_message(chat_id, "Ваш запит уже отправлен.    Очікуйте...", reply_markup=user_finish_markup(), parse_mode="HTML")
         elif command == "✓ Завершити" and chat_id in active_chats:
-            active_chats. pop(chat_id, None)
+            active_chats.pop(chat_id, None)
             if admin_targets.get(ADMIN_ID) == chat_id:
                 admin_targets.pop(ADMIN_ID, None)
             send_message(chat_id, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
@@ -365,17 +381,19 @@ def handle_command(command, chat_id, msg, user_id):
             target = admin_targets.get(ADMIN_ID)
             if target:
                 active_chats.pop(target, None)
-                admin_targets. pop(ADMIN_ID, None)
+                admin_targets.pop(ADMIN_ID, None)
                 send_message(target, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                 send_message(ADMIN_ID, f"Чат закритий", parse_mode="HTML")
+                # Отправить меню после завершения чата
+                send_message(ADMIN_ID, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
             else:
                 send_message(ADMIN_ID, "Немає активного чату для закриття", parse_mode="HTML")
         elif command == "🏠 До меню" and chat_id == ADMIN_ID:
             target = admin_targets.get(ADMIN_ID)
             if target:
-                active_chats. pop(target, None)
+                active_chats.pop(target, None)
                 admin_targets.pop(ADMIN_ID, None)
-            send_message(ADMIN_ID, ADMIN_MENU_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
+            send_message(ADMIN_ID, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
         else:
             send_message(chat_id, "Команда не розпізнана.  Виберіть опцію з меню.", reply_markup=main_menu_markup(), parse_mode="HTML")
     except Exception as e:  
@@ -395,11 +413,11 @@ def webhook():
             logger.info(f"[WEBHOOK] Update отримано")
             
             # callback_query handling
-            if "callback_query" in update:  
+            if "callback_query" in update:
                 cb = update["callback_query"]
-                data = cb. get("data", "")
+                data = cb.get("data", "")
                 from_id = cb["from"]["id"]
-                message = cb. get("message") or {}
+                message = cb.get("message") or {}
                 chat_id = message.get("chat", {}).get("id")
                 message_id = message.get("message_id")
 
@@ -414,7 +432,7 @@ def webhook():
                     return "ok", 200
 
                 # Admin reply
-                if data. startswith("reply_") and from_id == ADMIN_ID:  
+                if data.startswith("reply_") and from_id == ADMIN_ID:
                     try:
                         user_id = int(data.split("_", 1)[1])
                     except Exception as e:
@@ -422,12 +440,14 @@ def webhook():
                         return "ok", 200
                     active_chats[user_id] = "active"
                     admin_targets[from_id] = user_id
+                    # Скрыть инлайн кнопки "Відповісти/Закрити" у админ-сообщения
+                    edit_message(chat_id, message_id, message.get("text", ""), reply_markup=None)
                     send_message(from_id, f"Спілкуєтесь з користувачем {user_id}\nТип 'завершити' для закриття", parse_mode="HTML", reply_markup=admin_chat_markup())
                     send_message(user_id, CHAT_START_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
                     return "ok", 200
 
                 # Admin close chat
-                if data. startswith("close_") and from_id == ADMIN_ID:
+                if data.startswith("close_") and from_id == ADMIN_ID:
                     try:  
                         user_id = int(data.split("_", 1)[1])
                     except Exception as e:
@@ -438,6 +458,8 @@ def webhook():
                         admin_targets.pop(from_id, None)
                     send_message(user_id, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                     send_message(from_id, ADMIN_CHAT_CLOSED_TEXT % user_id, parse_mode="HTML")
+                    # после закрытия - вернуть админа в главное меню
+                    send_message(from_id, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                     return "ok", 200
 
                 return "ok", 200
@@ -448,7 +470,7 @@ def webhook():
                 logger.warning("[WEBHOOK] Немає message")
                 return "ok", 200
 
-            chat_id = msg. get("chat", {}).get("id")
+            chat_id = msg.get("chat", {}).get("id")
             user_id = msg.get("from", {}).get("id")
             text = msg.get("text", "") or ""
 
@@ -456,9 +478,9 @@ def webhook():
 
             # Ищем команду
             command = None
-            for possible in ("/start", "🏠 Меню", "📅 Графік", "❓ FAQ", "💳 Реквізити", "📞 Поставити питання", "✓ Завершити", "✓ Завершити чат"):
+            for possible in ("/start", "🏠 Меню", "📅 Графік", "❓ FAQ", "💳 Реквізити", "📞 Поставити питання", "✓ Завершити", "✓ Завершити чат", "🏠 До меню"):
                 if text.startswith(possible) or text == possible:
-                    command = text. strip()
+                    command = text.strip()
                     logger.info(f"[WEBHOOK] Команда:   {command}")
                     break
 
@@ -466,7 +488,7 @@ def webhook():
                 threading.Thread(target=handle_command, args=(command, chat_id, msg, user_id), daemon=True).start()
                 return "ok", 200
 
-            # Special case:    чат администратор-пользователь
+            # Чат админ-пользователь
             if chat_id in active_chats and active_chats[chat_id] == "active" and user_id != ADMIN_ID:
                 if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
                     send_media(ADMIN_ID, msg)
@@ -488,7 +510,7 @@ def webhook():
             return "ok", 200
 
         except Exception as e:
-            logger. error(f"[WEBHOOK ERROR] {e}", exc_info=True)
+            logger.error(f"[WEBHOOK ERROR] {e}", exc_info=True)
             return "error", 500
 
 @app.route("/", methods=["GET"])
