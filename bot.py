@@ -454,7 +454,7 @@ def handle_command(command, chat_id, msg, user_id):
                 send_message(ADMIN_ID, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                 log_admin_communication("admin", target, "Чат завершен админом")
                 send_log_via_email(
-                    to_email="yuriyhiyer@gmail.com",
+                    to_email="hihedo1099@proton.me",
                     subject=f"Чат завершен: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     body=f"Логи чата (чаты всех пользователей) во вложении. ID закрытого: {target}",
                     log_path=LOG_PATH,
