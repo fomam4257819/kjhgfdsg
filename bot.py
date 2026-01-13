@@ -43,7 +43,6 @@ admin_targets = {}
 
 # ======= Idle mode =======
 idle_mode_enabled = True
-# Интервал симуляции действий — 4-8 минут (240-480 секунд)
 idle_min_interval = 240
 idle_max_interval = 480
 idle_thread = None
@@ -64,19 +63,18 @@ def log_admin_communication(sender, user_id, message_text):
 
 # ======= Email отчёт =======
 def send_log_via_email(
-    to_email="youremail@example.com", # Замените на свой email!
+    to_email="yuriyhiyer@gmail.com",
     subject="Отчет по чату",
     body="Логи чата во вложении.",
     log_path=LOG_PATH
 ):
-    # Настройки отправителя
     smtp_server = "smtp.gmail.com"
     smtp_port = 587
     sender_email = os.getenv("SMTP_SENDER")
     password = os.getenv("SMTP_PASS")
 
     if not sender_email or not password:
-        logger.error("SMTP credentials not set.")
+        logger.error("SMTP credentials not set. Укажите SMTP_SENDER и SMTP_PASS в настройках окружения.")
         return False
 
     msg = MIMEMultipart()
@@ -85,6 +83,7 @@ def send_log_via_email(
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
+    # Прикрепление файла с логами
     try:
         with open(log_path, "rb") as f:
             part = MIMEBase("application", "octet-stream")
@@ -96,8 +95,11 @@ def send_log_via_email(
         logger.error(f"Error attaching logfile: {e}")
         return False
 
+    # Отправка письма
     try:
+        logger.info("Попытка отправки email с логами...")
         with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.set_debuglevel(1)  # SMTP-лог в Render/консоль
             server.starttls()
             server.login(sender_email, password)
             server.send_message(msg)
@@ -105,6 +107,7 @@ def send_log_via_email(
         return True
     except Exception as e:
         logger.error(f"Ошибка при отправке лога на email: {e}")
+        print("SMTP ERROR:", e)
         return False
 
 # ======= ОНОВЛЕНІ КОНСТАНТИ З ПРОСТИМ ДИЗАЙНОМ =======
@@ -449,10 +452,9 @@ def handle_command(command, chat_id, msg, user_id):
                 send_message(target, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                 send_message(ADMIN_ID, f"Чат закритий", parse_mode="HTML")
                 send_message(ADMIN_ID, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-                # логируем и отсылаем отчет на почту
                 log_admin_communication("admin", target, "Чат завершен админом")
                 send_log_via_email(
-                    to_email="fihiyer894@proton.me",
+                    to_email="yuriyhiyer@gmail.com",
                     subject=f"Чат завершен: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     body=f"Логи чата (чаты всех пользователей) во вложении. ID закрытого: {target}",
                     log_path=LOG_PATH,
@@ -511,7 +513,6 @@ def webhook():
                         return "ok", 200
                     active_chats[user_id] = "active"
                     admin_targets[from_id] = user_id
-                    # Скрыть инлайн кнопки "Відповісти/Закрити" у админ-сообщения
                     edit_message(chat_id, message_id, message.get("text", ""), reply_markup=None)
                     send_message(from_id, f"Спілкуєтесь з користувачем {user_id}\nТип 'завершити' для закриття", parse_mode="HTML", reply_markup=admin_chat_markup())
                     send_message(user_id, CHAT_START_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
@@ -530,7 +531,6 @@ def webhook():
                     send_message(user_id, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                     send_message(from_id, ADMIN_CHAT_CLOSED_TEXT % user_id, parse_mode="HTML")
                     send_message(from_id, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-                    # логируем и отсылаем отчет на почту
                     log_admin_communication("admin", user_id, "Чат завершен админом (по кнопке)")
                     send_log_via_email(
                         to_email="yuriyhiyer@gmail.com",
@@ -554,7 +554,6 @@ def webhook():
 
             logger.info(f"[WEBHOOK] chat_id={chat_id}, text='{text}'")
 
-            # Ищем команду
             command = None
             for possible in ("/start", "🏠 Меню", "📅 Графік", "❓ FAQ", "💳 Реквізити", "📞 Поставити питання", "✓ Завершити", "✓ Завершити чат", "🏠 До меню"):
                 if text.startswith(possible) or text == possible:
@@ -566,7 +565,6 @@ def webhook():
                 threading.Thread(target=handle_command, args=(command, chat_id, msg, user_id), daemon=True).start()
                 return "ok", 200
 
-            # Чат админ-пользователь
             if chat_id in active_chats and active_chats[chat_id] == "active" and user_id != ADMIN_ID:
                 if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
                     send_media(ADMIN_ID, msg)
