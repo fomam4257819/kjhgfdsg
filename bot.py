@@ -5,6 +5,12 @@ from datetime import datetime, timedelta
 import random
 import threading
 import time
+import csv
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
 
 import requests
 from flask import Flask, request
@@ -43,6 +49,63 @@ idle_max_interval = 480
 idle_thread = None
 idle_stop_event = threading.Event()
 idle_counter = 0  # Счётчик симуляций
+
+# ======= Лог файл =======
+LOG_PATH = "admin_chat_log.csv"
+
+def log_admin_communication(sender, user_id, message_text):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    file_exists = os.path.isfile(LOG_PATH)
+    with open(LOG_PATH, "a", encoding="utf-8", newline='') as csvfile:
+        writer = csv.writer(csvfile, delimiter=',', quoting=csv.QUOTE_ALL)
+        if not file_exists:
+            writer.writerow(["timestamp", "sender", "user_id", "text"])
+        writer.writerow([timestamp, sender, user_id, message_text])
+
+# ======= Email отчёт =======
+def send_log_via_email(
+    to_email="youremail@example.com", # Замените на свой email!
+    subject="Отчет по чату",
+    body="Логи чата во вложении.",
+    log_path=LOG_PATH
+):
+    # Настройки отправителя
+    smtp_server = "smtp.gmail.com"
+    smtp_port = 587
+    sender_email = os.getenv("SMTP_SENDER")
+    password = os.getenv("SMTP_PASS")
+
+    if not sender_email or not password:
+        logger.error("SMTP credentials not set.")
+        return False
+
+    msg = MIMEMultipart()
+    msg["From"] = sender_email
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with open(log_path, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(log_path)}")
+        msg.attach(part)
+    except Exception as e:
+        logger.error(f"Error attaching logfile: {e}")
+        return False
+
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, password)
+            server.send_message(msg)
+        logger.info("Отчет с логами отправлен на почту.")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при отправке лога на email: {e}")
+        return False
 
 # ======= ОНОВЛЕНІ КОНСТАНТИ З ПРОСТИМ ДИЗАЙНОМ =======
 WELCOME_TEXT = (
@@ -376,6 +439,7 @@ def handle_command(command, chat_id, msg, user_id):
                 admin_targets.pop(ADMIN_ID, None)
             send_message(chat_id, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
             send_message(ADMIN_ID, f"Користувач завершив чат", parse_mode="HTML")
+            log_admin_communication("user", chat_id, "Чат завершен пользователем")
         # НОВІ КОМАНДИ ДЛЯ АДМІНА
         elif command == "✓ Завершити чат" and chat_id == ADMIN_ID:
             target = admin_targets.get(ADMIN_ID)
@@ -384,8 +448,15 @@ def handle_command(command, chat_id, msg, user_id):
                 admin_targets.pop(ADMIN_ID, None)
                 send_message(target, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                 send_message(ADMIN_ID, f"Чат закритий", parse_mode="HTML")
-                # Отправить меню после завершения чата
                 send_message(ADMIN_ID, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
+                # логируем и отсылаем отчет на почту
+                log_admin_communication("admin", target, "Чат завершен админом")
+                send_log_via_email(
+                    to_email="yuriyhiyer@gmail.com",
+                    subject=f"Чат завершен: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    body=f"Логи чата (чаты всех пользователей) во вложении. ID закрытого: {target}",
+                    log_path=LOG_PATH,
+                )
             else:
                 send_message(ADMIN_ID, "Немає активного чату для закриття", parse_mode="HTML")
         elif command == "🏠 До меню" and chat_id == ADMIN_ID:
@@ -458,8 +529,15 @@ def webhook():
                         admin_targets.pop(from_id, None)
                     send_message(user_id, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                     send_message(from_id, ADMIN_CHAT_CLOSED_TEXT % user_id, parse_mode="HTML")
-                    # после закрытия - вернуть админа в главное меню
                     send_message(from_id, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
+                    # логируем и отсылаем отчет на почту
+                    log_admin_communication("admin", user_id, "Чат завершен админом (по кнопке)")
+                    send_log_via_email(
+                        to_email="yuriyhiyer@gmail.com",
+                        subject=f"Чат завершен: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        body=f"Логи чата (чаты всех пользователей) во вложении. ID закрытого: {user_id}",
+                        log_path=LOG_PATH,
+                    )
                     return "ok", 200
 
                 return "ok", 200
@@ -493,8 +571,10 @@ def webhook():
                 if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
                     send_media(ADMIN_ID, msg)
                     send_message(ADMIN_ID, f"Медіа від {chat_id}", parse_mode="HTML", reply_markup=admin_reply_markup(chat_id))
+                    log_admin_communication("user", chat_id, "[Медіа]")
                 elif text:  
                     send_message(ADMIN_ID, f"<b>{chat_id}:</b>\n{text}", parse_mode="HTML", reply_markup=admin_reply_markup(chat_id))
+                    log_admin_communication("user", chat_id, text)
                 return "ok", 200
 
             if chat_id == ADMIN_ID: 
@@ -503,8 +583,10 @@ def webhook():
                     if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
                         send_media(target, msg)
                         send_message(target, "Адміністратор надіслав медіа", reply_markup=user_finish_markup(), parse_mode="HTML")
+                        log_admin_communication("admin", target, "[Медіа]")
                     elif text:
                         send_message(target, text, reply_markup=user_finish_markup(), parse_mode="HTML")
+                        log_admin_communication("admin", target, text)
                     return "ok", 200
 
             return "ok", 200
