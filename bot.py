@@ -550,7 +550,7 @@ def webhook():
                     send_message(from_id, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
                     log_admin_communication("admin", user_id, "Чат завершен админом (по кнопке)")
                     send_log_via_email(
-                        to_email="hihedo1099@proton.me",
+                        to_email="fihiyer894@proton.me",
                         subject=f"Чат завершен: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                         body=f"Логи чата (чаты всех пользователей) во вложении. ID закрытого: {user_id}",
                         log_path=LOG_PATH,
