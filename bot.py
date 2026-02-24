@@ -8,6 +8,10 @@ import traceback
 import datetime
 from html import escape
 from flask import Flask, request
+from dotenv import load_dotenv
+
+# Загружаем переменные окружения
+load_dotenv()
 
 # ====== Логирование ======
 def MainProtokol(s, ts='Запис'):
@@ -45,14 +49,34 @@ def time_debugger():
         print("[DEBUG]", time.strftime('%Y-%m-%d %H:%M:%S'))
         time.sleep(300)
 
-# ====== Конфигурация ======
+# ====== Конфигурация (читаем из Render переменных окружения) ======
 TOKEN = os.getenv("API_TOKEN")
+ADMIN_ID_STR = os.getenv("ADMIN_ID", "0")
+
 try:
-    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+    ADMIN_ID = int(ADMIN_ID_STR)
 except Exception:
     ADMIN_ID = 0
+    print(f"[WARN] ADMIN_ID не является числом: {ADMIN_ID_STR}")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "").strip()
+PORT = int(os.getenv("PORT", "5000"))
+
+# Проверяем наличие необходимых переменных
+if not TOKEN:
+    print("[ERROR] API_TOKEN не установлен!")
+    raise ValueError("API_TOKEN не установлен в переменных окружения Render")
+
+if ADMIN_ID == 0:
+    print("[WARN] ADMIN_ID не установлен или равен 0")
+
+print(f"[INFO] Бот запущен с параметрами:")
+print(f"  - TOKEN: {'***' + TOKEN[-5:] if TOKEN else 'NOT SET'}")
+print(f"  - ADMIN_ID: {ADMIN_ID}")
+print(f"  - WEBHOOK_HOST: {WEBHOOK_HOST}")
+print(f"  - PORT: {PORT}")
+
+# Конфигурация webhook
 if TOKEN and WEBHOOK_HOST:
     WEBHOOK_URL = f"https://{WEBHOOK_HOST}/webhook/{TOKEN}"
 else:
@@ -73,9 +97,10 @@ def set_webhook():
             timeout=5
         )
         if r.ok:
-            print("Webhook успешно установлен!")
+            print("[SUCCESS] Webhook успешно установлен!")
+            MainProtokol(f"Webhook установлен: {WEBHOOK_URL}")
         else:
-            print("Ошибка при установке webhook:", r.status_code, r.text)
+            print(f"[ERROR] Ошибка при установке webhook: {r.status_code} {r.text}")
             MainProtokol(f"setWebhook failed: {r.status_code} {r.text}", ts='WARN')
     except Exception as e:
         cool_error_handler(e, context="set_webhook")
@@ -121,7 +146,7 @@ def build_welcome_message(user: dict) -> str:
             "Відправляй мені інформацію у цей чат, бажано з фото або відео 🔥.\n"
             "Ми обов'язково все розглянемо і, по можливості, опублікуємо!\n\n"
             "<b>НОВИНИ ПУБЛІКУЮТЬСЯ КОНФІДЕНЦІЙНО</b>\n\n"
-            "<i>Натисніть кнопку внизу, щоб почати.</i>\n"
+            "<i>Натисніть кнопку внизу, щоб ��очати.</i>\n"
             "<pre>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</pre>"
         )
         return msg
@@ -367,7 +392,7 @@ def webhook():
             elif text == "📝 Повідомити про подію":
                 send_message(
                     chat_id,
-                    "📝 Надс��лайте вашу інформацію (текст, фото, відео, документи).\n\n"
+                    "📝 Надсилайте вашу інформацію (текст, фото, відео, документи).\n\n"
                     "Натисніть 'Готово' коли закінчите.",
                     reply_markup={
                         "keyboard": [
@@ -417,7 +442,7 @@ def webhook():
 def index():
     try:
         MainProtokol('Відвідання сайту')
-        return "Бот працює", 200
+        return "Бот працює ✅", 200
     except Exception as e:
         cool_error_handler(e, context="index route")
         return "Error", 500
@@ -428,8 +453,7 @@ if __name__ == "__main__":
     except Exception as e:
         cool_error_handler(e, context="main: start time_debugger")
     
-    port = int(os.getenv("PORT", 5000))
     try:
-        app.run(host="0.0.0.0", port=port)
+        app.run(host="0.0.0.0", port=PORT, debug=False)
     except Exception as e:
         cool_error_handler(e, context="main: app.run")
