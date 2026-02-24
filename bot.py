@@ -50,8 +50,8 @@ def time_debugger():
         time.sleep(300)
 
 # ====== Конфигурация (читаем из Render переменных окружения) ======
-TOKEN = os.getenv("API_TOKEN")
-ADMIN_ID_STR = os.getenv("ADMIN_ID", "0")
+TOKEN = os.getenv("API_TOKEN", "").strip()
+ADMIN_ID_STR = os.getenv("ADMIN_ID", "0").strip()
 
 try:
     ADMIN_ID = int(ADMIN_ID_STR)
@@ -59,6 +59,7 @@ except Exception:
     ADMIN_ID = 0
     print(f"[WARN] ADMIN_ID не является числом: {ADMIN_ID_STR}")
 
+# WEBHOOK_HOST - это основной домен, например: kjhgfdsg.onrender.com
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "").strip()
 PORT = int(os.getenv("PORT", "5000"))
 
@@ -71,16 +72,20 @@ if ADMIN_ID == 0:
     print("[WARN] ADMIN_ID не установлен или равен 0")
 
 print(f"[INFO] Бот запущен с параметрами:")
-print(f"  - TOKEN: {'***' + TOKEN[-5:] if TOKEN else 'NOT SET'}")
+print(f"  - TOKEN: {'***' + TOKEN[-5:] if len(TOKEN) > 5 else '***'}")
 print(f"  - ADMIN_ID: {ADMIN_ID}")
 print(f"  - WEBHOOK_HOST: {WEBHOOK_HOST}")
 print(f"  - PORT: {PORT}")
 
-# Конфигурация webhook
+# Конфигурация webhook - ВАЖНО: используем HTTPS!
 if TOKEN and WEBHOOK_HOST:
-    WEBHOOK_URL = f"https://{WEBHOOK_HOST}/webhook/{TOKEN}"
+    # Убедитесь, что WEBHOOK_HOST не содержит https://, это просто домен
+    webhook_domain = WEBHOOK_HOST.replace("https://", "").replace("http://", "").rstrip("/")
+    WEBHOOK_URL = f"https://{webhook_domain}/webhook"
 else:
     WEBHOOK_URL = ""
+
+print(f"[INFO] WEBHOOK_URL: {WEBHOOK_URL}")
 
 # ====== Установка webhook ======
 def set_webhook():
@@ -91,20 +96,33 @@ def set_webhook():
         print("[INFO] WEBHOOK_HOST not set; skip setting webhook.")
         return
     try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
-            params={"url": WEBHOOK_URL},
+        # Сначала удаляем старый webhook
+        r_delete = requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
             timeout=5
         )
+        print(f"[INFO] Delete webhook response: {r_delete.status_code}")
+        
+        # Затем устанавливаем новый
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            data={"url": WEBHOOK_URL},
+            timeout=5
+        )
+        
         if r.ok:
-            print("[SUCCESS] Webhook успешно установлен!")
+            result = r.json()
+            print(f"[SUCCESS] Webhook успешно установлен!")
+            print(f"[INFO] Response: {result}")
             MainProtokol(f"Webhook установлен: {WEBHOOK_URL}")
         else:
-            print(f"[ERROR] Ошибка при установке webhook: {r.status_code} {r.text}")
+            print(f"[ERROR] Ошибка при установке webhook: {r.status_code}")
+            print(f"[ERROR] Response: {r.text}")
             MainProtokol(f"setWebhook failed: {r.status_code} {r.text}", ts='WARN')
     except Exception as e:
         cool_error_handler(e, context="set_webhook")
 
+# Устанавливаем webhook при старте
 set_webhook()
 
 # ====== UI helpers ======
@@ -146,7 +164,7 @@ def build_welcome_message(user: dict) -> str:
             "Відправляй мені інформацію у цей чат, бажано з фото або відео 🔥.\n"
             "Ми обов'язково все розглянемо і, по можливості, опублікуємо!\n\n"
             "<b>НОВИНИ ПУБЛІКУЮТЬСЯ КОНФІДЕНЦІЙНО</b>\n\n"
-            "<i>Натисніть кнопку внизу, щоб ��очати.</i>\n"
+            "<i>Натисніть кнопку внизу, щоб почати.</i>\n"
             "<pre>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</pre>"
         )
         return msg
@@ -327,7 +345,8 @@ def flask_global_error_handler(e):
     cool_error_handler(e, context="Flask global error handler")
     return "Внутрішня помилка сервера.", 500
 
-@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+# Webhook маршрут БЕЗ TOKEN в URL (более безопасно)
+@app.route("/webhook", methods=["POST"])
 def webhook():
     global waiting_for_admin
     try:
@@ -454,6 +473,7 @@ if __name__ == "__main__":
         cool_error_handler(e, context="main: start time_debugger")
     
     try:
+        print(f"\n[INFO] Запуск Flask на 0.0.0.0:{PORT}")
         app.run(host="0.0.0.0", port=PORT, debug=False)
     except Exception as e:
         cool_error_handler(e, context="main: app.run")
