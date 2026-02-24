@@ -89,7 +89,7 @@ MAIN_MENU = [
 def get_reply_buttons():
     return {
         "keyboard": [
-        [{"text": "📝 Повідомити про подію"},
+            [{"text": "📝 Повідомити про подію"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False
