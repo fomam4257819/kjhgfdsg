@@ -59,11 +59,9 @@ except Exception:
     ADMIN_ID = 0
     print(f"[WARN] ADMIN_ID не является числом: {ADMIN_ID_STR}")
 
-# WEBHOOK_HOST - это основной домен, например: kjhgfdsg.onrender.com
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "").strip()
 PORT = int(os.getenv("PORT", "5000"))
 
-# Проверяем наличие необходимых переменных
 if not TOKEN:
     print("[ERROR] API_TOKEN не установлен!")
     raise ValueError("API_TOKEN не установлен в переменных окружения Render")
@@ -77,9 +75,7 @@ print(f"  - ADMIN_ID: {ADMIN_ID}")
 print(f"  - WEBHOOK_HOST: {WEBHOOK_HOST}")
 print(f"  - PORT: {PORT}")
 
-# Конфигурация webhook - ВАЖНО: используем HTTPS!
 if TOKEN and WEBHOOK_HOST:
-    # Убедитесь, что WEBHOOK_HOST не содержит https://, это просто домен
     webhook_domain = WEBHOOK_HOST.replace("https://", "").replace("http://", "").rstrip("/")
     WEBHOOK_URL = f"https://{webhook_domain}/webhook"
 else:
@@ -96,14 +92,12 @@ def set_webhook():
         print("[INFO] WEBHOOK_HOST not set; skip setting webhook.")
         return
     try:
-        # Сначала удаляем старый webhook
         r_delete = requests.get(
             f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
             timeout=5
         )
         print(f"[INFO] Delete webhook response: {r_delete.status_code}")
         
-        # Затем устанавливаем новый
         r = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/setWebhook",
             data={"url": WEBHOOK_URL},
@@ -122,7 +116,6 @@ def set_webhook():
     except Exception as e:
         cool_error_handler(e, context="set_webhook")
 
-# Устанавливаем webhook при старте
 set_webhook()
 
 # ====== UI helpers ======
@@ -147,7 +140,6 @@ def get_reply_buttons():
         "one_time_keyboard": False
     }
 
-# Приветствие
 def build_welcome_message(user: dict) -> str:
     try:
         first = (user.get('first_name') or "").strip()
@@ -196,7 +188,6 @@ def send_message(chat_id, text, reply_markup=None, parse_mode=None, timeout=8):
         MainProtokol(str(e), 'Помилка мережі')
         return None
 
-# ====== Inline reply markup для админа ======
 def _get_reply_markup_for_admin(user_id: int):
     kb = {
         "inline_keyboard": [
@@ -205,7 +196,6 @@ def _get_reply_markup_for_admin(user_id: int):
     }
     return kb
 
-# ====== Карточка для админа ======
 def build_admin_info(message: dict) -> str:
     try:
         user = message.get('from', {}) or {}
@@ -218,7 +208,6 @@ def build_admin_info(message: dict) -> str:
         display_name = (first + (" " + last if last else "")).strip() or "Без імені"
         display_html = escape(display_name)
 
-        # profile link
         if username:
             profile_url = f"https://t.me/{username}"
             profile_label = f"@{escape(username)}"
@@ -268,7 +257,6 @@ def build_admin_info(message: dict) -> str:
         cool_error_handler(e, "build_admin_info")
         return "Нова подія від користувача."
 
-# ====== Helpers to forward admin replies ======
 def _post_request(url, data=None, timeout=10):
     try:
         r = requests.post(url, data=data, timeout=timeout)
@@ -336,6 +324,7 @@ def forward_admin_message_to_user(user_id: int, admin_msg: dict):
 
 # ====== Глобальное состояние ======
 waiting_for_admin = {}
+user_messages = {}  # chat_id -> list of messages
 
 # ====== Flask App ======
 app = Flask(__name__)
@@ -345,10 +334,9 @@ def flask_global_error_handler(e):
     cool_error_handler(e, context="Flask global error handler")
     return "Внутрішня помилка сервера.", 500
 
-# Webhook маршрут БЕЗ TOKEN в URL (более безопасно)
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global waiting_for_admin
+    global waiting_for_admin, user_messages
     try:
         data_raw = request.get_data(as_text=True)
         update = json.loads(data_raw)
@@ -359,7 +347,6 @@ def webhook():
             chat_id = call['from']['id']
             data = call.get('data', '')
 
-            # Ответ админа на сообщение пользователя
             if data.startswith("reply_") and chat_id == ADMIN_ID:
                 try:
                     user_id = int(data.split("_", 1)[1])
@@ -409,6 +396,8 @@ def webhook():
                 )
             # Кнопка "📝 Повідомити про подію"
             elif text == "📝 Повідомити про подію":
+                # Инициализируем сбор сообщений
+                user_messages[chat_id] = []
                 send_message(
                     chat_id,
                     "📝 Надсилайте вашу інформацію (текст, фото, відео, документи).\n\n"
@@ -422,21 +411,32 @@ def webhook():
                         "one_time_keyboard": False
                     }
                 )
-            # Готово - отправляем админу
+            # Готово - отправляем все собранные сообщения админу
             elif text == "✅ Готово":
                 send_message(chat_id, "✅ Дякуємо! Ваша інформація відправлена адміністратору.", reply_markup=get_reply_buttons())
                 
-                # Отправляем админу
-                admin_info = build_admin_info(message)
-                orig_user_id = message.get('from', {}).get('id')
-                reply_markup = _get_reply_markup_for_admin(orig_user_id)
-                send_message(ADMIN_ID, admin_info, reply_markup=reply_markup, parse_mode="HTML")
+                # Отправляем информацию о пользователе
+                if chat_id in user_messages and user_messages[chat_id]:
+                    first_msg = user_messages[chat_id][0]
+                    admin_info = build_admin_info(first_msg)
+                    orig_user_id = first_msg.get('from', {}).get('id')
+                    reply_markup = _get_reply_markup_for_admin(orig_user_id)
+                    send_message(ADMIN_ID, admin_info, reply_markup=reply_markup, parse_mode="HTML")
+                    
+                    # Отправляем все собранные медиа
+                    for msg in user_messages[chat_id]:
+                        send_collected_message(ADMIN_ID, msg)
+                    
+                    # Очищаем список
+                    user_messages.pop(chat_id, None)
             # Скасувати
             elif text == "❌ Скасувати":
                 send_message(chat_id, "❌ Скасовано.", reply_markup=get_reply_buttons())
-            # По умолчанию - сохраняем медиа/текст
+                user_messages.pop(chat_id, None)
+            # Собираем все остальные сообщения
             else:
-                if from_id != ADMIN_ID:
+                if from_id != ADMIN_ID and chat_id in user_messages:
+                    user_messages[chat_id].append(message)
                     send_message(
                         chat_id,
                         "✅ Додано. Продовжуйте надсилати або натисніть ✅ Готово.",
@@ -456,6 +456,64 @@ def webhook():
         cool_error_handler(e, context="webhook - outer")
         MainProtokol(str(e), 'Помилка webhook')
         return "ok", 200
+
+def send_collected_message(chat_id, message: dict):
+    """Отправляет собранное сообщение (фото, видео, текст и т.д.) админу"""
+    try:
+        if 'photo' in message:
+            file_id = message['photo'][-1].get('file_id')
+            caption = message.get('caption', '')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+            payload = {"chat_id": chat_id, "photo": file_id}
+            if caption:
+                payload["caption"] = escape(caption)
+            requests.post(url, data=payload, timeout=10)
+            return
+
+        if 'video' in message:
+            file_id = message['video'].get('file_id')
+            caption = message.get('caption', '')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendVideo"
+            payload = {"chat_id": chat_id, "video": file_id}
+            if caption:
+                payload["caption"] = escape(caption)
+            requests.post(url, data=payload, timeout=10)
+            return
+
+        if 'document' in message:
+            file_id = message['document'].get('file_id')
+            caption = message.get('caption', '')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
+            payload = {"chat_id": chat_id, "document": file_id}
+            if caption:
+                payload["caption"] = escape(caption)
+            requests.post(url, data=payload, timeout=10)
+            return
+
+        if 'audio' in message:
+            file_id = message['audio'].get('file_id')
+            caption = message.get('caption', '')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendAudio"
+            payload = {"chat_id": chat_id, "audio": file_id}
+            if caption:
+                payload["caption"] = escape(caption)
+            requests.post(url, data=payload, timeout=10)
+            return
+
+        if 'voice' in message:
+            file_id = message['voice'].get('file_id')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendVoice"
+            payload = {"chat_id": chat_id, "voice": file_id}
+            requests.post(url, data=payload, timeout=10)
+            return
+
+        if 'text' in message:
+            text = message['text']
+            send_message(chat_id, f"<pre>{escape(text)}</pre>", parse_mode="HTML")
+            return
+
+    except Exception as e:
+        MainProtokol(f"Error sending collected message: {str(e)}", ts='ERROR')
 
 @app.route('/', methods=['GET'])
 def index():
