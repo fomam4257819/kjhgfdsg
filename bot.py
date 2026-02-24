@@ -1,544 +1,1183 @@
+# contents: расширение информации, отправляемой админу — больше полей и аккуратное HTML-оформление
 import os
-import logging
-from html import escape
-from datetime import datetime, timedelta
-import random
-import threading
 import time
-import csv
-
+import json
 import requests
+import threading
+import traceback
+import datetime
+from html import escape
+from pathlib import Path
 from flask import Flask, request
 
-# ======= Конфігурація =======
-TOKEN = os.getenv("API_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Environment variable API_TOKEN is required")
+# Библиотека для работы с разными БД (Postgres/SQLite)
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import ArgumentError
 
+# ====== Конфигурация дополнительных опций ======
+# Если True — уведомлять пользователя, когда админ добавляет его сообщение в статистику
+NOTIFY_USER_ON_ADD_STAT = True
+
+# ====== Логирование ======
+def MainProtokol(s, ts='Запис'):
+    dt = time.strftime('%d.%m.%Y %H:%M:') + '00'
+    try:
+        with open('log.txt', 'a', encoding='utf-8') as f:
+            f.write(f"{dt};{ts};{s}\n")
+    except Exception as e:
+        print("Ошибка записи в лог:", e)
+
+# ====== Простой и понятный обработчик ошибок ======
+def cool_error_handler(exc, context="", send_to_telegram=False):
+    exc_type = type(exc).__name__
+    tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    readable_msg = (
+        "\n" + "=" * 40 + "\n"
+        f"[ERROR] {exc_type}\n"
+        f"Context: {context}\n"
+        f"Time: {ts}\n"
+        "Traceback:\n"
+        f"{tb_str}"
+        + "=" * 40 + "\n"
+    )
+    try:
+        with open('critical_errors.log', 'a', encoding='utf-8') as f:
+            f.write(readable_msg)
+    except Exception as write_err:
+        print("Не удалось записать в 'critical_errors.log':", write_err)
+    try:
+        MainProtokol(f"{exc_type}: {str(exc)}", ts='ERROR')
+    except Exception as log_err:
+        print("MainProtokol вернул ошибку:", log_err)
+    print(readable_msg)
+    if send_to_telegram:
+        try:
+            admin_id = int(os.getenv("ADMIN_ID", "0"))
+            token = os.getenv("API_TOKEN")
+            if admin_id and token:
+                try:
+                    r = requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        data={
+                            "chat_id": admin_id,
+                            "text": f"⚠️ Критична помилка!\nТип: {exc_type}\nКонтекст: {context}\n\n{str(exc)}",
+                            "disable_web_page_preview": True
+                        },
+                        timeout=5
+                    )
+                    if not r.ok:
+                        MainProtokol(f"Telegram notify failed: {r.status_code} {r.text}", ts='WARN')
+                except Exception as telegram_err:
+                    print("Не удалось отправить уведомление в Telegram:", telegram_err)
+        except Exception as env_err:
+            print("Ошибка при подготовке уведомления в Telegram:", env_err)
+
+# ====== Фоновый отладчик времени (каждые 5 минут) ======
+def time_debugger():
+    while True:
+        print("[DEBUG]", time.strftime('%Y-%m-%d %H:%M:%S'))
+        time.sleep(300)
+
+# ====== Главное меню (reply-кнопки) — премиальное оформление ======
+# Визуально изменён элемент "Реклама" на "📣 Реклама 🔔" чтобы отличаться от "📝 Повідомити про подію"
+MAIN_MENU = [
+    "✨ Головне",
+    "📢 Про нас",
+    "🕰️ Графік роботи",
+    "📝 Повідомити про подію",
+    "📊 Статистика подій",
+    "📣 Реклама 🔔"
+]
+
+def get_reply_buttons():
+    return {
+        "keyboard": [
+            [{"text": "📣 Реклама 🔔"}],
+            [{"text": "📢 Про нас"}, {"text": "🕰️ Графік роботи"}],
+            [{"text": "📝 Повідомити про подію"}, {"text": "📊 Статистика подій"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
+# ====== "Про компанію" (детальний варіант) ======
+ABOUT_COMPANY_DETAILED = (
+    "<b>Про нас</b>\n\n"
+    "Ми — інформаційний телеграм-канал про життя міста: події, надзвичайні ситуації та важливі оголошення. "
+    "Публікуємо перевірену інформацію та працюємо для зручності мешканців.\n\n"
+    "<b>Приватність</b>: особисті дані <b>НЕ</b> передаються адміністратору лише обробка повідомлення\n\n"
+    "<b>Режим роботи</b>: відповіді за можливості, термінові питання обробляються першочергово.\n"
+)
+
+# ====== Категории событий ======
+ADMIN_SUBCATEGORIES = [
+    "🏗️ Техногенні",
+    "🌪️ Природні",
+    "👥 Соціальні",
+    "⚔️ Воєнні",
+    "🕵️‍♂️ Розшук",
+    "📦 Інше"
+]
+
+def get_admin_subcategory_buttons():
+    return {
+        "keyboard": [[{"text": cat}] for cat in ADMIN_SUBCATEGORIES],
+        "resize_keyboard": True,
+        "one_time_keyboard": True
+    }
+
+# ====== Состояния ожидания ======
+waiting_for_admin_message = set()
+user_admin_category = {}
+waiting_for_ad_message = set()
+pending_mode = {}   # chat_id -> "ad"|"event"
+pending_media = {}  # chat_id -> list of message dicts
+waiting_for_admin = {}
+
+# НОВОЕ: флоу добавления події адміністратором
+admin_adding_event = {}  # admin_id -> {'category': str, 'messages': [msg_dicts]}
+
+# Блокировка для потокобезопасных операций над глобальными структурами
+GLOBAL_LOCK = threading.Lock()
+
+# ====== Настройки БД ======
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL:
+    db_url = DATABASE_URL
+else:
+    default_sqlite = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events.db")
+    db_url = f"sqlite:///{default_sqlite}"
+
+_engine: Engine = None
+def get_engine():
+    global _engine
+    if _engine is None:
+        try:
+            if not db_url:
+                raise ValueError("DATABASE_URL is empty")
+            if db_url.startswith("sqlite:///"):
+                _engine = create_engine(db_url, connect_args={"check_same_thread": False}, future=True)
+                print(f"[DEBUG] Using SQLite DB URL: {db_url}")
+            else:
+                if '://' not in db_url:
+                    raise ArgumentError(f"Invalid DB URL (missing scheme): {db_url}")
+                _engine = create_engine(db_url, future=True)
+                print(f"[DEBUG] Using DB URL: {db_url}")
+        except ArgumentError as e:
+            cool_error_handler(e, "get_engine (ArgumentError)")
+            MainProtokol(f"Invalid DATABASE_URL: {db_url}", ts='WARN')
+            try:
+                fallback_sqlite = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events.db")
+                fallback_url = f"sqlite:///{fallback_sqlite}"
+                _engine = create_engine(fallback_url, connect_args={"check_same_thread": False}, future=True)
+                print(f"[WARN] Fallback to SQLite at {fallback_sqlite} due to invalid DATABASE_URL.")
+                MainProtokol("Fallback to SQLite due to invalid DATABASE_URL", ts='WARN')
+            except Exception as e2:
+                cool_error_handler(e2, "get_engine (fallback sqlite)")
+                raise
+        except ImportError as e:
+            cool_error_handler(e, "get_engine (ImportError)")
+            MainProtokol("DB driver import failed, falling back to local SQLite", ts='WARN')
+            try:
+                fallback_sqlite = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events.db")
+                fallback_url = f"sqlite:///{fallback_sqlite}"
+                _engine = create_engine(fallback_url, connect_args={"check_same_thread": False}, future=True)
+                print(f"[WARN] Fallback to SQLite at {fallback_sqlite} due to ImportError for DB driver.")
+            except Exception as e2:
+                cool_error_handler(e2, "get_engine (fallback sqlite after ImportError)")
+                raise
+        except Exception as e:
+            cool_error_handler(e, "get_engine")
+            MainProtokol(f"get_engine general exception: {str(e)}", ts='ERROR')
+            try:
+                fallback_sqlite = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events.db")
+                fallback_url = f"sqlite:///{fallback_sqlite}"
+                _engine = create_engine(fallback_url, connect_args={"check_same_thread": False}, future=True)
+                print(f"[WARN] Fallback to SQLite at {fallback_sqlite} due to engine creation error.")
+                MainProtokol("Fallback to SQLite due to engine creation error", ts='WARN')
+            except Exception as e2:
+                cool_error_handler(e2, "get_engine (fallback sqlite after general exception)")
+                raise
+    return _engine
+
+def init_db():
+    try:
+        engine = get_engine()
+        create_sql = """
+        CREATE TABLE IF NOT EXISTS events (
+            id SERIAL PRIMARY KEY,
+            category TEXT NOT NULL,
+            dt TIMESTAMP NOT NULL
+        );
+        """
+        if engine.dialect.name == "sqlite":
+            create_sql = """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                dt TEXT NOT NULL
+            );
+            """
+        with engine.begin() as conn:
+            conn.execute(text(create_sql))
+    except Exception as e:
+        cool_error_handler(e, "init_db")
+
+def save_event(category):
+    try:
+        engine = get_engine()
+        now = datetime.datetime.utcnow()
+        if engine.dialect.name == "sqlite":
+            dt_val = now.isoformat()
+            insert_sql = "INSERT INTO events (category, dt) VALUES (:cat, :dt)"
+            with engine.begin() as conn:
+                conn.execute(text(insert_sql), {"cat": category, "dt": dt_val})
+        else:
+            insert_sql = "INSERT INTO events (category, dt) VALUES (:cat, :dt)"
+            with engine.begin() as conn:
+                conn.execute(text(insert_sql), {"cat": category, "dt": now})
+    except Exception as e:
+        cool_error_handler(e, "save_event")
+
+def get_stats():
+    res = {cat: {'week': 0, 'month': 0} for cat in ADMIN_SUBCATEGORIES}
+    try:
+        engine = get_engine()
+        now = datetime.datetime.utcnow()
+        week_threshold = now - datetime.timedelta(days=7)
+        month_threshold = now - datetime.timedelta(days=30)
+        with engine.connect() as conn:
+            if engine.dialect.name == "sqlite":
+                week_ts = week_threshold.isoformat()
+                month_ts = month_threshold.isoformat()
+                q_week = text("SELECT category, COUNT(*) as cnt FROM events WHERE dt >= :week GROUP BY category")
+                q_month = text("SELECT category, COUNT(*) as cnt FROM events WHERE dt >= :month GROUP BY category")
+                wk = conn.execute(q_week, {"week": week_ts}).all()
+                mo = conn.execute(q_month, {"month": month_ts}).all()
+            else:
+                q_week = text("SELECT category, COUNT(*) as cnt FROM events WHERE dt >= :week GROUP BY category")
+                q_month = text("SELECT category, COUNT(*) as cnt FROM events WHERE dt >= :month GROUP BY category")
+                wk = conn.execute(q_week, {"week": week_threshold}).all()
+                mo = conn.execute(q_month, {"month": month_threshold}).all()
+            for row in wk:
+                cat = row[0]
+                cnt = int(row[1])
+                if cat in res:
+                    res[cat]['week'] = cnt
+            for row in mo:
+                cat = row[0]
+                cnt = int(row[1])
+                if cat in res:
+                    res[cat]['month'] = cnt
+        return res
+    except Exception as e:
+        cool_error_handler(e, "get_stats")
+        MainProtokol(str(e), 'get_stats_exception')
+        return {cat: {'week': 0, 'month': 0} for cat in ADMIN_SUBCATEGORIES}
+
+def clear_stats_if_month_passed():
+    try:
+        engine = get_engine()
+        now = datetime.datetime.utcnow()
+        month_threshold = now - datetime.timedelta(days=30)
+        with engine.begin() as conn:
+            if engine.dialect.name == "sqlite":
+                month_ts = month_threshold.isoformat()
+                conn.execute(text("DELETE FROM events WHERE dt < :month"), {"month": month_ts})
+            else:
+                conn.execute(text("DELETE FROM events WHERE dt < :month"), {"month": month_threshold})
+    except Exception as e:
+        cool_error_handler(e, "clear_stats_if_month_passed")
+
+def stats_autoclear_daemon():
+    while True:
+        try:
+            clear_stats_if_month_passed()
+        except Exception as e:
+            cool_error_handler(e, "stats_autoclear_daemon")
+        time.sleep(3600)
+
+# Инициализация БД при старте
+init_db()
+
+# ====== Конфигурация ======
+TOKEN = os.getenv("API_TOKEN")
 try:
     ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-except ValueError:
+except Exception:
     ADMIN_ID = 0
 
-SERVER_URL = os.getenv("SERVER_URL", "http://localhost:5000")
-WEBHOOK_URL = f"{SERVER_URL}/webhook"
+# WEBHOOK: можно задать хост в переменной WEBHOOK_HOST, иначе webhook не устанавливается автоматически
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "").strip()
+if TOKEN and WEBHOOK_HOST:
+    WEBHOOK_URL = f"https://{WEBHOOK_HOST}/webhook/{TOKEN}"
+else:
+    WEBHOOK_URL = ""
+
+# ====== Установка webhook ======
+def set_webhook():
+    if not TOKEN:
+        print("[WARN] TOKEN is not set, webhook not initialized.")
+        return
+    if not WEBHOOK_URL:
+        print("[INFO] WEBHOOK_HOST not set; skip setting webhook.")
+        return
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            params={"url": WEBHOOK_URL},
+            timeout=5
+        )
+        if r.ok:
+            print("Webhook успешно установлен!")
+        else:
+            print("Ошибка при установке webhook:", r.status_code, r.text)
+            MainProtokol(f"setWebhook failed: {r.status_code} {r.text}", ts='WARN')
+    except Exception as e:
+        cool_error_handler(e, context="set_webhook")
+
+set_webhook()
+
+# ====== UI helpers ======
+def send_chat_action(chat_id, action='typing'):
+    if not TOKEN:
+        return
+    try:
+        requests.post(
+            f'https://api.telegram.org/bot{TOKEN}/sendChatAction',
+            data={'chat_id': chat_id, 'action': action},
+            timeout=3
+        )
+    except Exception:
+        pass
+
+# Прекрасное приветствие — делает бот «дорогим»
+def build_welcome_message(user: dict) -> str:
+    try:
+        first = (user.get('first_name') or "").strip()
+        last = (user.get('last_name') or "").strip()
+        display = (first + (" " + last if last else "")).strip() or "Друже"
+        is_premium = user.get('is_premium', False)
+        vip_badge = " ✨" if is_premium else ""
+        name_html = escape(display)
+        msg = (
+            "<pre>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</pre>\n"
+            f"<b>✨ Ласкаво просимо, {name_html}{vip_badge}!</b>\n\n"
+            "<b>На зв'язку адмін каналу!</b>\n"
+            "Хочеш поділитися цікавою новиною?\n\n"
+            "Відправляй мені інформацію у цей чат, бажано з фото або відео 🔥.\n"
+            "Ми обов'язково все розглянемо і, по можливості, опублікуємо!\n\n"
+            "<b>НОВИНИ ПУБЛІКУЮТЬСЯ КОНФІДЕНЦІЙНО</b>\n\n"
+            "<b>Що доступно прямо зараз:</b>\n"
+            "• 📝 Швидко повідомити про подію\n"
+            "• 📊 Переглянути статистику по категоріях\n"
+            "• 📣 Надіслати рекламне повідомлення\n\n"
+            "<i>Натисніть одну з кнопок внизу, щоб почати.</i>\n"
+            "<pre>━━━━━━━━━━━━━━━━━━━━━━━━━━━━</pre>"
+        )
+        return msg
+    except Exception as e:
+        cool_error_handler(e, "build_welcome_message")
+        return "Ласкаво просимо! Використайте меню для початку."
+
+# ====== Отправка сообщений (parse_mode поддерживается) ======
+def send_message(chat_id, text, reply_markup=None, parse_mode=None, timeout=8):
+    if not TOKEN:
+        print("[WARN] Попытка отправки сообщения без TOKEN")
+        return None
+    url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
+    payload = {
+        'chat_id': chat_id,
+        'text': text
+    }
+    if reply_markup:
+        payload['reply_markup'] = json.dumps(reply_markup)
+    if parse_mode:
+        payload['parse_mode'] = parse_mode
+    try:
+        resp = requests.post(url, data=payload, timeout=timeout)
+        if not resp.ok:
+            MainProtokol(resp.text, 'Помилка надсилання')
+        return resp
+    except Exception as e:
+        cool_error_handler(e, context="send_message")
+        MainProtokol(str(e), 'Помилка мережі')
+        return None
+
+# ====== Inline reply markup для админа (теперь с кнопкой "додати до статистики") ======
+def _get_reply_markup_for_admin(user_id: int, orig_chat_id: int = None, orig_msg_id: int = None):
+    kb = {
+        "inline_keyboard": [
+            [{"text": "✉️ Відповісти", "callback_data": f"reply_{user_id}"}]
+        ]
+    }
+    # Если известны оригинальные id — добавляем кнопку добавления в статистику
+    if orig_chat_id is not None and orig_msg_id is not None:
+        kb["inline_keyboard"][0].append({"text": "➕ Додати до статистики", "callback_data": f"addstat_{orig_chat_id}_{orig_msg_id}"})
+    return kb
+
+# ====== Новый helper: строим расширённую карточку для админа (окультуренная) ======
+def build_admin_info(message: dict, category: str = None, msg_type: str = None) -> str:
+    """
+    msg_type: 'event' | 'ad' | 'message' (None: inferred from category)
+    """
+    try:
+        # determine message type if not given
+        final_type = msg_type
+        if final_type is None:
+            final_type = 'event' if category else 'message'
+
+        # choose title/header based on type
+        if final_type == 'event':
+            title = "📩 Нова подія"
+            sep = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        elif final_type == 'ad':
+            title = "📣 Рекламне повідомлення"
+            sep = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        else:
+            title = "📩 Нове повідомлення"
+            sep = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        user = message.get('from', {}) or {}
+        first = (user.get('first_name') or "").strip()
+        last = (user.get('last_name') or "").strip()
+        username = user.get('username')
+        user_id = user.get('id')
+        is_premium = user.get('is_premium', None)
+
+        display_name = (first + (" " + last if last else "")).strip() or "Без імені"
+        display_html = escape(display_name)
+
+        # profile link
+        if username:
+            profile_url = f"https://t.me/{username}"
+            profile_label = f"@{escape(username)}"
+            profile_html = f"<a href=\"{profile_url}\">{profile_label}</a>"
+        else:
+            profile_url = f"tg://user?id={user_id}"
+            profile_label = "Відкрити профіль"
+            profile_html = f"<a href=\"{profile_url}\">{escape(profile_label)}</a>"
+
+        # contact and location (if present)
+        contact = message.get('contact')
+        contact_html = ""
+        if isinstance(contact, dict):
+            phone = contact.get('phone_number')
+            contact_name = (contact.get('first_name') or "") + ((" " + contact.get('last_name')) if contact.get('last_name') else "")
+            contact_parts = []
+            if contact_name:
+                contact_parts.append(escape(contact_name.strip()))
+            if phone:
+                contact_parts.append(escape(phone))
+            if contact_parts:
+                contact_html = ", ".join(contact_parts)
+
+        location = message.get('location')
+        location_html = ""
+        if isinstance(location, dict):
+            lat = location.get('latitude')
+            lon = location.get('longitude')
+            if lat is not None and lon is not None:
+                location_html = f"{lat}, {lon}"
+
+        # meta
+        msg_id = message.get('message_id', '-')
+        msg_date = message.get('date')
+        try:
+            date_str = datetime.datetime.utcfromtimestamp(int(msg_date)).strftime('%Y-%m-%d %H:%M:%S UTC') if msg_date else '-'
+        except Exception:
+            date_str = str(msg_date or '-')
+
+        # text (caption or text)
+        text = message.get('text') or message.get('caption') or ''
+        # category
+        category_html = escape(category) if category else None
+
+        parts = []
+        parts.append(f"<pre>{sep}</pre>")
+        parts.append(f"<b>{title}</b>")
+        parts.append("")
+
+        # big profile
+        name_line = f"<b>{display_html}</b>"
+        if is_premium:
+            name_line += " ✨"
+        parts.append(name_line)
+        parts.append(f"<b>Профіль:</b> {profile_html}")
+        parts.append(f"<b>ID:</b> {escape(str(user_id)) if user_id is not None else '-'}")
+
+        if contact_html:
+            parts.append(f"<b>Телефон:</b> {contact_html}")
+        if location_html:
+            parts.append(f"<b>Локація:</b> {escape(location_html)}")
+
+        if category_html:
+            parts.append(f"<b>Категорія:</b> {category_html}")
+
+        parts.append("")
+        parts.append(f"<b>Message ID:</b> {escape(str(msg_id))}")
+        parts.append(f"<b>Дата:</b> {escape(str(date_str))}")
+
+        # show text only if present
+        if text:
+            display_text = text if len(text) <= 2000 else text[:1997] + "..."
+            parts.append("")
+            parts.append("<b>Текст / Опис:</b>")
+            parts.append("<pre>{}</pre>".format(escape(display_text)))
+
+        parts.append("")
+        parts.append("<i>Повідомлення відформатовано для зручного перегляду.</i>")
+        parts.append(f"<pre>{sep}</pre>")
+
+        return "\n".join(parts)
+    except Exception as e:
+        cool_error_handler(e, "build_admin_info")
+        try:
+            return f"Повідомлення від користувача.  ID: {escape(str(message.get('from', {}).get('id', '-')))}"
+        except Exception:
+            return "Нове повідомлення."
+
+# ====== Helpers to forward admin replies (теперь поддерживает медиа) ======
+def _post_request(url, data=None, files=None, timeout=10):
+    try:
+        r = requests.post(url, data=data, files=files, timeout=timeout)
+        if not r.ok:
+            MainProtokol(f"Request failed: {url} -> {r.status_code} {r.text}", ts='WARN')
+        return r
+    except Exception as e:
+        MainProtokol(f"Network error for {url}: {str(e)}", ts='ERROR')
+        return None
+
+def forward_admin_message_to_user(user_id: int, admin_msg: dict):
+    try:
+        if not user_id:
+            return False
+        # prefer caption if present, else text
+        caption = admin_msg.get('caption') or admin_msg.get('text') or ""
+        safe_caption = escape(caption) if caption else None
+
+        if 'photo' in admin_msg:
+            file_id = admin_msg['photo'][-1].get('file_id')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+            payload = {"chat_id": user_id, "photo": file_id}
+            if safe_caption:
+                payload["caption"] = f"💬 Відповідь адміністратора:\n<pre>{safe_caption}</pre>"
+                payload["parse_mode"] = "HTML"
+            else:
+                payload["caption"] = "💬 Відповідь адміністратора"
+            _post_request(url, data=payload)
+            return True
+
+        if 'video' in admin_msg:
+            file_id = admin_msg['video'].get('file_id')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendVideo"
+            payload = {"chat_id": user_id, "video": file_id}
+            if safe_caption:
+                payload["caption"] = f"💬 Відповідь адміністратора:\n<pre>{safe_caption}</pre>"
+                payload["parse_mode"] = "HTML"
+            else:
+                payload["caption"] = "💬 Відповідь адміністратора"
+            _post_request(url, data=payload)
+            return True
+
+        if 'animation' in admin_msg:
+            file_id = admin_msg['animation'].get('file_id')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendAnimation"
+            payload = {"chat_id": user_id, "animation": file_id}
+            if safe_caption:
+                payload["caption"] = f"💬 Відповідь адміністратора:\n<pre>{safe_caption}</pre>"
+                payload["parse_mode"] = "HTML"
+            else:
+                payload["caption"] = "💬 Відповідь адміністратора"
+            _post_request(url, data=payload)
+            return True
+
+        if 'document' in admin_msg:
+            file_id = admin_msg['document'].get('file_id')
+            filename = admin_msg.get('document', {}).get('file_name', 'документ')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
+            payload = {"chat_id": user_id, "document": file_id}
+            if safe_caption:
+                payload["caption"] = f"💬 Відповідь адміністратора:\n<pre>{safe_caption}</pre>"
+                payload["parse_mode"] = "HTML"
+            else:
+                payload["caption"] = f"💬 Відповідь адміністратора — {escape(filename)}"
+            _post_request(url, data=payload)
+            return True
+
+        if 'voice' in admin_msg:
+            file_id = admin_msg['voice'].get('file_id')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendVoice"
+            payload = {"chat_id": user_id, "voice": file_id}
+            if safe_caption:
+                # sendVoice doesn't support caption param in some API versions; keep it minimal
+                try:
+                    payload["caption"] = f"💬 Відповідь адміністратора:\n<pre>{safe_caption}</pre>"
+                    payload["parse_mode"] = "HTML"
+                except Exception:
+                    pass
+            _post_request(url, data=payload)
+            return True
+
+        if 'audio' in admin_msg:
+            file_id = admin_msg['audio'].get('file_id')
+            url = f"https://api.telegram.org/bot{TOKEN}/sendAudio"
+            payload = {"chat_id": user_id, "audio": file_id}
+            if safe_caption:
+                payload["caption"] = f"💬 Відповідь адміністратора:\n<pre>{safe_caption}</pre>"
+                payload["parse_mode"] = "HTML"
+            _post_request(url, data=payload)
+            return True
+
+        if 'contact' in admin_msg:
+            c = admin_msg['contact']
+            name = ((c.get('first_name') or "") + (" " + (c.get('last_name') or "") if c.get('last_name') else "")).strip()
+            phone = c.get('phone_number', '')
+            msg = "<b>💬 Відповідь адміністратора:</b>\n"
+            if name:
+                msg += f"<b>Контакт:</b> {escape(name)}\n"
+            if phone:
+                msg += f"<b>Телефон:</b> {escape(phone)}\n"
+            send_message(user_id, msg, parse_mode="HTML")
+            return True
+
+        if 'location' in admin_msg:
+            loc = admin_msg['location']
+            lat = loc.get('latitude')
+            lon = loc.get('longitude')
+            msg = "<b>💬 Відповідь адміністратора:</b>\n"
+            msg += f"<b>Локація:</b> {escape(str(lat))}, {escape(str(lon))}\n"
+            try:
+                maps = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+                msg += f"\n<a href=\"{maps}\">Відкрити в картах</a>"
+            except Exception:
+                pass
+            send_message(user_id, msg, parse_mode="HTML")
+            return True
+
+        if caption:
+            send_message(user_id, f"💬 Відповідь адміністратора:\n<pre>{escape(caption)}</pre>", parse_mode="HTML")
+            return True
+
+        send_message(user_id, "💬 Відповідь адміністратора (без тексту).")
+        return True
+    except Exception as e:
+        cool_error_handler(e, "forward_admin_message_to_user")
+        return False
+
+# ====== НОВЫЕ функции для пакетной отправки медиа ======
+
+def send_media_collection_keyboard(chat_id):
+    kb = {
+        "keyboard": [
+            [{"text": "✅ Надіслати"}],
+            [{"text": "❌ Скасувати"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+    send_message(
+        chat_id,
+        "Надсилайте усі потрібні фото, відео, документи та/або текст (кілька повідомлень). "
+        "Як закінчите — натисніть ✅ Надіслати.",
+        reply_markup=kb
+    )
+
+def _collect_media_summary_and_payloads(msgs):
+    media_items = []
+    doc_msgs = []
+    leftover_texts = []
+
+    captions_for_media = []
+    other_texts = []
+
+    for m in msgs:
+        txt = m.get('text') or m.get('caption') or ''
+        if 'photo' in m:
+            try:
+                file_id = m['photo'][-1]['file_id']
+            except Exception:
+                file_id = None
+            if file_id:
+                media_items.append({"type": "photo", "media": file_id, "orig_text": txt})
+                if txt:
+                    captions_for_media.append(txt)
+        elif 'video' in m:
+            file_id = m['video'].get('file_id')
+            if file_id:
+                media_items.append({"type": "video", "media": file_id, "orig_text": txt})
+                if txt:
+                    captions_for_media.append(txt)
+        elif 'animation' in m:
+            file_id = m['animation'].get('file_id')
+            if file_id:
+                media_items.append({"type": "animation", "media": file_id, "orig_text": txt})
+                if txt:
+                    captions_for_media.append(txt)
+        elif 'document' in m:
+            doc_msgs.append({"file_id": m['document'].get('file_id'), "file_name": m['document'].get('file_name'), "text": txt})
+        else:
+            if txt:
+                other_texts.append(txt)
+            else:
+                t = []
+                for k in ['sticker', 'voice', 'contact', 'location', 'audio']:
+                    if k in m:
+                        t.append(k)
+                if t:
+                    other_texts.append(f"[contains: {','.join(t)}]")
+
+    combined_caption = None
+    if media_items:
+        if captions_for_media:
+            joined = "\n\n".join(captions_for_media)
+            if len(joined) > 1000:
+                joined = joined[:997] + "..."
+            combined_caption = joined
+        for idx, mi in enumerate(media_items):
+            if idx == 0 and combined_caption:
+                mi['caption'] = combined_caption
+            else:
+                mi['caption'] = ""
+    leftover_texts = other_texts
+    return media_items, doc_msgs, leftover_texts
+
+def send_compiled_media_to_admin(chat_id):
+    with GLOBAL_LOCK:
+        msgs = list(pending_media.get(chat_id, []))
+    if not msgs:
+        send_message(chat_id, "Немає медіа для надсилання.")
+        return
+    m_category = None
+    with GLOBAL_LOCK:
+        if pending_mode.get(chat_id) == "event":
+            m_category = user_admin_category.get(chat_id, 'Без категорії')
+        current_mode = pending_mode.get(chat_id)
+    if m_category in ADMIN_SUBCATEGORIES:
+        try:
+            save_event(m_category)
+        except Exception as e:
+            cool_error_handler(e, "save_event in send_compiled_media_to_admin")
+
+    media_items, doc_msgs, leftover_texts = _collect_media_summary_and_payloads(msgs)
+    # orig identifiers from the first user message
+    orig_chat_id = msgs[0]['chat']['id']
+    orig_msg_id = msgs[0].get('message_id')
+    orig_user_id = msgs[0].get('from', {}).get('id')
+
+    # determine message_type for admin card
+    if current_mode == "event":
+        admin_msg_type = "event"
+    elif current_mode == "ad":
+        admin_msg_type = "ad"
+    else:
+        admin_msg_type = "message"
+
+    admin_info = build_admin_info(msgs[0], category=m_category, msg_type=admin_msg_type)
+    reply_markup = _get_reply_markup_for_admin(orig_user_id, orig_chat_id, orig_msg_id)
+    send_message(ADMIN_ID, admin_info, reply_markup=reply_markup, parse_mode="HTML")
+
+    try:
+        if media_items:
+            if len(media_items) > 1:
+                sendmedia = []
+                for mi in media_items:
+                    obj = {"type": mi["type"], "media": mi["media"]}
+                    if mi.get("caption"):
+                        obj["caption"] = mi["caption"]
+                        obj["parse_mode"] = "HTML"
+                    sendmedia.append(obj)
+                url = f"https://api.telegram.org/bot{TOKEN}/sendMediaGroup"
+                payload = {"chat_id": ADMIN_ID, "media": json.dumps(sendmedia)}
+                try:
+                    r = requests.post(url, data=payload, timeout=10)
+                    if not r.ok:
+                        MainProtokol(f"sendMediaGroup failed: {r.status_code} {r.text}", "MediaGroupFail")
+                except Exception as e:
+                    MainProtokol(f"sendMediaGroup error: {str(e)}", "MediaGroupFail")
+            else:
+                mi = media_items[0]
+                if mi["type"] == "photo":
+                    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+                    payload = {"chat_id": ADMIN_ID, "photo": mi["media"]}
+                    if mi.get("caption"):
+                        payload["caption"] = mi["caption"]
+                        payload["parse_mode"] = "HTML"
+                    try:
+                        r = requests.post(url, data=payload, timeout=10)
+                        if not r.ok:
+                            MainProtokol(f"sendPhoto failed: {r.status_code} {r.text}", "PhotoFail")
+                    except Exception as e:
+                        MainProtokol(f"sendPhoto error: {str(e)}", "PhotoFail")
+                elif mi["type"] == "video":
+                    url = f"https://api.telegram.org/bot{TOKEN}/sendVideo"
+                    payload = {"chat_id": ADMIN_ID, "video": mi["media"]}
+                    if mi.get("caption"):
+                        payload["caption"] = mi["caption"]
+                        payload["parse_mode"] = "HTML"
+                    try:
+                        r = requests.post(url, data=payload, timeout=10)
+                        if not r.ok:
+                            MainProtokol(f"sendVideo failed: {r.status_code} {r.text}", "VideoFail")
+                    except Exception as e:
+                        MainProtokol(f"sendVideo error: {str(e)}", "VideoFail")
+                elif mi["type"] == "animation":
+                    url = f"https://api.telegram.org/bot{TOKEN}/sendAnimation"
+                    payload = {"chat_id": ADMIN_ID, "animation": mi["media"]}
+                    if mi.get("caption"):
+                        payload["caption"] = mi["caption"]
+                        payload["parse_mode"] = "HTML"
+                    try:
+                        r = requests.post(url, data=payload, timeout=10)
+                        if not r.ok:
+                            MainProtokol(f"sendAnimation failed: {r.status_code} {r.text}", "AnimationFail")
+                    except Exception as e:
+                        MainProtokol(f"sendAnimation error: {str(e)}", "AnimationFail")
+    except Exception as e:
+        cool_error_handler(e, "send_compiled_media_to_admin: media send")
+
+    for d in doc_msgs:
+        try:
+            payload = {
+                "chat_id": ADMIN_ID,
+                "document": d["file_id"]
+            }
+            if d.get("text"):
+                payload["caption"] = d["text"] if len(d["text"]) <= 1000 else d["text"][:997] + "..."
+                payload["parse_mode"] = "HTML"
+            r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument", data=payload, timeout=10)
+            if not r.ok:
+                MainProtokol(f"sendDocument failed: {r.status_code} {r.text}", "DocumentFail")
+        except Exception as e:
+            MainProtokol(f"sendDocument error: {str(e)}", "DocumentFail")
+
+    if leftover_texts:
+        try:
+            combined = "\n\n".join(leftover_texts)
+            send_message(ADMIN_ID, f"<b>Текст від користувача:</b>\n<pre>{escape(combined)}</pre>", parse_mode="HTML")
+        except Exception as e:
+            MainProtokol(f"text send error: {str(e)}", "TextFail")
+
+    with GLOBAL_LOCK:
+        pending_media.pop(chat_id, None)
+        pending_mode.pop(chat_id, None)
 
 app = Flask(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-logger = logging.getLogger(__name__)
+@app.errorhandler(Exception)
+def flask_global_error_handler(e):
+    cool_error_handler(e, context="Flask global error handler")
+    return "Внутрішня помилка сервера.", 500
 
-# ======= Стан чатів =======
-active_chats = {}
-admin_targets = {}
+def format_stats_message(stats: dict) -> str:
+    cat_names = [c for c in ADMIN_SUBCATEGORIES]
+    max_cat_len = max(len(escape(c)) for c in cat_names) + 1
+    col1 = "Категорія".ljust(max_cat_len)
+    header = f"{col1}  {'7 дн':>6}  {'30 дн':>6}"
+    lines = [header, "-" * (max_cat_len + 16)]
+    for cat in ADMIN_SUBCATEGORIES:
+        name = escape(cat)
+        week = stats.get(cat, {}).get('week', 0)
+        month = stats.get(cat, {}).get('month', 0)
+        lines.append(f"{name.ljust(max_cat_len)}  {str(week):>6}  {str(month):>6}")
+    content = "\n".join(lines)
+    return "<pre>━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" + content + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━</pre>"
 
-# ======= Idle mode =======
-idle_mode_enabled = True
-idle_min_interval = 240
-idle_max_interval = 480
-idle_thread = None
-idle_stop_event = threading.Event()
-idle_counter = 0  # Счётчик симуляций
-
-# ======= Лог файл =======
-LOG_PATH = "admin_chat_log.csv"
-
-def log_admin_communication(sender, user_id, message_text):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    file_exists = os.path.isfile(LOG_PATH)
-    with open(LOG_PATH, "a", encoding="utf-8", newline='') as csvfile:
-        writer = csv. writer(csvfile, delimiter=',', quoting=csv.QUOTE_ALL)
-        if not file_exists:
-            writer.writerow(["timestamp", "sender", "user_id", "text"])
-        writer.writerow([timestamp, sender, user_id, message_text])
-
-# ======= ОНОВЛЕНІ КОНСТАНТИ З ПРОСТИМ ДИЗАЙНОМ =======
-WELCOME_TEXT = (
-    "<b>Ласкаво просимо!   👋</b>\n\n"
-    "Оберіть, як ми можемо вам допомогти:"
-)
-
-SCHEDULE_TEXT = (
-    "<b>Графік роботи</b>\n\n"
-    "<b>Пн–Чт:   </b> 09:00 – 18:00\n"
-    "<b>Пт:  </b> 09:00 – 15:00\n"
-    "<b>Сб–Нд: </b> Вихідні\n\n"
-    "<i>Запити в позаробочий час будуть розглянуті, але згодом ✓</i>"
-)
-
-FAQ_TEXT = (
-    "<b>Часті питання</b>\n\n"
-    "Натисніть кнопку під питанням, щоб дізнатися відповідь:"
-)
-
-OFF_HOURS_TEXT = (
-    "<b>Позаробочий час ⏰</b>\n\n"
-    "Адміністрація зараз не працює, але ваш запит буде розглянутий згодом.\n\n"
-    "Спробуйте переглянути FAQ або графік роботи."
-)
-
-PAYMENT_TEXT = (
-    "<b>Реквізити для оплати</b>\n\n"
-    "Якщо ви купите наш бот, тут будуть ваші реквізити 😊"
-)
-
-CHAT_START_TEXT = (
-    "<b>Чат розпочинається 💬</b>\n\n"
-    "Ви підключені до адміністратора.\n"
-    "Напишіть своє питання."
-)
-
-CHAT_CLOSED_TEXT = (
-    "<b>Чат закритий ✓</b>\n\n"
-    "Дякуємо за спілкування!"
-)
-
-ADMIN_CHAT_CLOSED_TEXT = (
-    "Чат закритий ✓\n"
-    "Користувач:   <code>%s</code>"
-)
-
-# ======= Функція для перевірки робочого часу =======
-def is_working_hours():
-    try:
-        now = datetime.utcnow()
-        now_local = now + timedelta(hours=2)
-        weekday = now_local.weekday()
-        hour = now_local.hour
-        minute = now_local.minute
-        current_time = hour * 60 + minute
-        if weekday in (5, 6):
-            return False
-        if weekday in (0, 1, 2, 3):
-            start = 9 * 60
-            end = 18 * 60
-            return start <= current_time < end
-        if weekday == 4:
-            start = 9 * 60
-            end = 15 * 60
-            return start <= current_time < end
-        return False
-    except Exception as e:  
-        logger.error(f"Error checking working hours: {e}")
-        return True
-
-# ======= Функції для холостого ходу =======
-def simulate_user_activity():
-    global idle_counter
-    try:
-        activity_log = [
-            "Користувач натиснув кнопку",
-            "Користувач переглядає меню",
-            "Користувач читає FAQ",
-        ]
-        activity = random.choice(activity_log)
-        now = datetime.now()
-        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        idle_counter += 1
-        out = (
-            f"\n----- SIMULATION #{idle_counter} -----\n"
-            f"Симуляція дії користувача в {timestamp}\n"
-            f"Дія: {activity}\n"
-            f"------------------------------"
-        )
-        print(out)
-        logger.info(f"[IDLE MODE] #{idle_counter}:   {timestamp} → {activity}")
-    except Exception as e:
-        logger.error(f"Error in simulate_user_activity: {e}")
-
-def idle_mode_worker():
-    logger.info("[IDLE MODE] Холостий хід активований")
-    while not idle_stop_event.is_set():
-        try:
-            wait_time = random.randint(idle_min_interval, idle_max_interval)
-            logger.info(f"[IDLE MODE] Очікування {wait_time//60} хвилин ({wait_time} с) до наступної симуляції...")
-            if idle_stop_event.wait(timeout=wait_time):
-                break
-            simulate_user_activity()
-        except Exception as e:  
-            logger.error(f"[IDLE MODE] Помилка:   {e}")
-            time.sleep(5)
-
-def start_idle_mode():
-    global idle_thread
-    try:
-        if idle_mode_enabled and idle_thread is None:
-            idle_stop_event.  clear()
-            idle_thread = threading.Thread(target=idle_mode_worker, daemon=True)
-            idle_thread.start()
-            logger.info("[IDLE MODE] Потік запущен")
-    except Exception as e:   
-        logger.error(f"Error starting idle mode: {e}")
-
-def stop_idle_mode():
-    global idle_thread
-    try:
-        if idle_thread is not None:
-            idle_stop_event.set()
-            idle_thread.join(timeout=2)
-            idle_thread = None
-            logger.  info("[IDLE MODE] Потік зупинен")
-    except Exception as e:     
-        logger.error(f"Error stopping idle mode: {e}")
-
-# ======= Функція для реєстрації вебхука =======
-def register_webhook():
-    url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
-    payload = {
-        "url":   WEBHOOK_URL,
-        "allowed_updates": ["message", "callback_query"]
-    }
-    try:  
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("ok"):
-            logger.info(f"✅ Вебхук зареєстрований: {WEBHOOK_URL}")
-            return True
-        else:
-            logger.error(f"❌ Помилка:   {result. get('description')}")
-            return False
-    except Exception as e:
-        logger. error(f"❌ Помилка реєстрації вебхука: {e}")
-        return False
-
-def delete_webhook():
-    url = f"https://api.telegram.org/bot{TOKEN}/deleteWebhook"
-    try:
-        resp = requests.post(url, timeout=10)
-        resp.raise_for_status()
-        logger.info("✅ Вебхук видалений")
-    except Exception as e:
-        logger.error(f"❌ Помилка видалення вебхука: {e}")
-
-# ======= ОНОВЛЕНІ РОЗМІТКИ З ПРОСТИМ ДИЗАЙНОМ =======
-def main_menu_markup():
-    return {
-        "keyboard": [
-            [{"text":   "❓ FAQ"}],
-            [{"text":  "📞 Поставити питання"}],
-            [{"text":   "📅 Графік"}, {"text": "💳 Реквізити"}],
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-        "input_field_placeholder": "Виберіть опцію...",
-    }
-
-def user_finish_markup():
-    return {
-        "keyboard": [[{"text": "✓ Завершити"}, {"text": "🏠 Меню"}]],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-    }
-
-def admin_chat_markup():
-    """Розмітка для адміністратора під час спілкування з користувачем"""
-    return {
-        "keyboard": [[{"text": "✓ Завершити чат"}]],
-        "resize_keyboard":   True,
-        "one_time_keyboard": False,
-    }
-
-def admin_reply_markup(user_id):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✉️ Відповісти", "callback_data": f"reply_{user_id}"},
-            ],
-            [
-                {"text": "✗ Закрити", "callback_data": f"close_{user_id}"},
-            ],
-        ]
-    }
-
-# ======= ІНТЕРАКТИВНЕ FAQ З КНОПКАМИ =======
-def faq_markup():
-    """Кнопки для FAQ"""
-    return {
-        "inline_keyboard": [
-            [{"text": "⏱️ Скільки часу займає розробка?  ", "callback_data": "faq_time"}],
-            [{"text": "💰 Коли оплатити?   ", "callback_data": "faq_payment"}],
-            [{"text": "🔄 Можна змінити завдання?  ", "callback_data": "faq_change"}],
-            [{"text":   "🏠 Назад", "callback_data": "back_to_menu"}],
-        ]
-    }
-
-faq_answers = {
-    "faq_time": (
-        "<b>⏱️ Скільки часу займає розробка бота?</b>\n\n"
-        "Зазвичай від 1 до 7 робочих днів, залежно від складності проекту."
-    ),
-    "faq_payment": (
-        "<b>💰 Коли потрібно оплатити?  </b>\n\n"
-        "Оплата здійснюється <b>після завершення</b> роботи.   "
-        "Спочатку ми розробляємо, потім ви оплачуєте."
-    ),
-    "faq_change": (
-        "<b>🔄 Чи можна змінити завдання?</b>\n\n"
-        "Так!   Невеликі зміни обговорюються з адміністратором "
-        "і можуть бути внесені в процес розробки."
-    ),
-}
-
-# ======= Хелпери для відправки повідомлень =======
-def send_message(chat_id, text, reply_markup=None, parse_mode=None):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_markup is not None:
-        payload["reply_markup"] = __import__('json').dumps(reply_markup)
-    if parse_mode is not None:  
-        payload["parse_mode"] = parse_mode
-    try:   
-        resp = requests.post(url, json=payload, timeout=8)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        logger.error(f"Failed to send message to {chat_id}: {e}")
-        return None
-
-def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
-    """Редактирует сообщение (для кнопок FAQ)"""
-    url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text":   text,
-        "parse_mode": parse_mode
-    }
-    if reply_markup is not None:
-        payload["reply_markup"] = __import__('json').dumps(reply_markup)
-    try: 
-        resp = requests.post(url, json=payload, timeout=8)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:  
-        logger.error(f"Failed to edit message:   {e}")
-        return None
-
-def send_media(chat_id, msg):
-    try:
-        for key, api in [
-            ("photo", "sendPhoto"),
-            ("document", "sendDocument"),
-            ("video", "sendVideo"),
-            ("audio", "sendAudio"),
-            ("voice", "sendVoice"),
-        ]:
-            if key in msg:
-                file_id = msg[key][-1]["file_id"] if key == "photo" else msg[key]["file_id"]
-                url = f"https://api.telegram.org/bot{TOKEN}/{api}"
-                payload = {"chat_id": chat_id, key: file_id}
-                if "caption" in msg:
-                    payload["caption"] = msg.  get("caption")
-                try:
-                    resp = requests. post(url, json=payload, timeout=8)
-                    resp.raise_for_status()
-                    return True
-                except Exception as e:  
-                    logger.error(f"Failed to send media to {chat_id}: {e}")
-                    return False
-    except Exception as e: 
-        logger.error(f"Error in send_media: {e}")
-    return False
-
-# ======= Обработка команд в отдельном потоке =======
-def handle_command(command, chat_id, msg, user_id):
-    try:
-        logger.info(f"[THREAD] Команда: {command} від {chat_id}")
-        # ADMIN COMMANDS
-        if chat_id == ADMIN_ID and command == "/help":
-            send_message(chat_id, WELCOME_TEXT, parse_mode="HTML")
-        elif command.  startswith("/start") or command == "🏠 Меню":
-            active_chats.  pop(user_id, None)
-            admin_targets. pop(ADMIN_ID, None)
-            send_message(chat_id, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-        elif command == "📅 Графік":
-            send_message(chat_id, SCHEDULE_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-        elif command == "❓ FAQ":
-            send_message(chat_id, FAQ_TEXT, reply_markup=faq_markup(), parse_mode="HTML")
-        elif command == "💳 Реквізити":    
-            send_message(chat_id, PAYMENT_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-        elif command == "📞 Поставити питання":
-            if chat_id not in active_chats:
-                active_chats[chat_id] = "pending"
-                if not is_working_hours():
-                    send_message(chat_id, OFF_HOURS_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
-                else:  
-                    send_message(chat_id, "Адміністратор прочитає ваш запит в найближчий час.. .", reply_markup=user_finish_markup(), parse_mode="HTML")
-                notif = (
-                    f"<b>НОВИЙ ЗАПИТ</b>\n\n"
-                    f"User ID: <code>{chat_id}</code>\n"
-                    f"Час:  {datetime.now().strftime('%H:%M:%S')}"
-                )
-                send_message(ADMIN_ID, notif, parse_mode="HTML", reply_markup=admin_reply_markup(chat_id))
-                if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
-                    send_media(ADMIN_ID, msg)
-            else:
-                if not is_working_hours():
-                    send_message(chat_id, OFF_HOURS_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
-                else:
-                    send_message(chat_id, "Ваш запит уже отправлен.   Очікуйте.. .", reply_markup=user_finish_markup(), parse_mode="HTML")
-        elif command == "✓ Завершити" and chat_id in active_chats:
-            active_chats.  pop(chat_id, None)
-            if admin_targets.get(ADMIN_ID) == chat_id:
-                admin_targets.pop(ADMIN_ID, None)
-            send_message(chat_id, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-            send_message(ADMIN_ID, f"Користувач завершив чат", parse_mode="HTML")
-            log_admin_communication("user", chat_id, "Чат завершен пользователем")
-        # НОВІ КОМАНДИ ДЛЯ АДМІНА
-        elif command == "✓ Завершити чат" and chat_id == ADMIN_ID:
-            target = admin_targets.get(ADMIN_ID)
-            if target:   
-                active_chats.pop(target, None)
-                admin_targets.  pop(ADMIN_ID, None)
-                send_message(target, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-                send_message(ADMIN_ID, f"Чат закритий", parse_mode="HTML")
-                send_message(ADMIN_ID, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-                log_admin_communication("admin", target, "Чат завершен админом")
-            else:
-                send_message(ADMIN_ID, "Немає активного чату для закриття", parse_mode="HTML")
-        elif command == "🏠 До меню" and chat_id == ADMIN_ID:
-            target = admin_targets.get(ADMIN_ID)
-            if target:
-                active_chats. pop(target, None)
-                admin_targets.  pop(ADMIN_ID, None)
-            send_message(ADMIN_ID, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-        else:
-            send_message(chat_id, "Команда не розпізнана.  Виберіть опцію з меню.", reply_markup=main_menu_markup(), parse_mode="HTML")
-    except Exception as e:  
-        logger.error(f"[THREAD ERROR] {e}", exc_info=True)
-
-# ======= Webhook handler =======
-@app.route("/webhook", methods=["GET", "POST"])
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():
-    logger.info(f"[WEBHOOK] {request.method}")
-    
-    if request.method == "GET":
-        return "OK", 200
+    global pending_media, pending_mode, admin_adding_event
+    try:
+        data_raw = request.get_data(as_text=True)
+        update = json.loads(data_raw)
 
-    if request.method == "POST":  
-        try:
-            update = request.get_json(force=True)
-            logger.info(f"[WEBHOOK] Update отримано")
-            
-            # callback_query handling
-            if "callback_query" in update:  
-                cb = update["callback_query"]
-                data = cb.get("data", "")
-                from_id = cb["from"]["id"]
-                message = cb.get("message") or {}
-                chat_id = message.get("chat", {}).get("id")
-                message_id = message.get("message_id")
+        # CALLBACK HANDLING
+        if 'callback_query' in update:
+            call = update['callback_query']
+            chat_id = call['from']['id']
+            data = call.get('data', '')
 
-                # FAQ callbacks
-                if data in faq_answers:
-                    edit_message(chat_id, message_id, faq_answers[data], reply_markup=faq_markup())
-                    return "ok", 200
+            # Ответ админу на сообщение пользователя (существующий функционал)
+            if data.startswith("reply_") and chat_id == ADMIN_ID:
+                try:
+                    user_id = int(data.split("_", 1)[1])
+                    with GLOBAL_LOCK:
+                        waiting_for_admin[ADMIN_ID] = user_id
+                    send_message(
+                        ADMIN_ID,
+                        f"✍️ Введіть відповідь для користувача {user_id} (будь-який текст або файл):"
+                    )
+                except Exception as e:
+                    cool_error_handler(e, context="webhook: callback_query reply_")
+                    MainProtokol(str(e), 'Помилка callback reply')
 
-                # Back to menu
-                if data == "back_to_menu":
-                    edit_message(chat_id, message_id, WELCOME_TEXT, reply_markup=main_menu_markup())
-                    return "ok", 200
+            # НОВОЕ: админ нажал "додати до статистики" — открываем выбор категории
+            elif data.startswith("addstat_") and chat_id == ADMIN_ID:
+                try:
+                    parts = data.split("_", 2)
+                    if len(parts) == 3:
+                        orig_chat_id = int(parts[1])
+                        orig_msg_id = int(parts[2])
+                        kb = {"inline_keyboard": []}
+                        row = []
+                        for idx, cat in enumerate(ADMIN_SUBCATEGORIES):
+                            row.append({"text": cat, "callback_data": f"confirm_addstat|{orig_chat_id}|{orig_msg_id}|{idx}"})
+                            if len(row) == 2:
+                                kb["inline_keyboard"].append(row)
+                                row = []
+                        if row:
+                            kb["inline_keyboard"].append(row)
+                        send_message(ADMIN_ID, "Оберіть категорію для додавання до статистики:", reply_markup=kb)
+                    else:
+                        send_message(ADMIN_ID, "Невірний формат callback для додавання в статистику.")
+                except Exception as e:
+                    cool_error_handler(e, context="webhook: addstat callback")
+                    MainProtokol(str(e), 'addstat_callback_err')
 
-                # Admin reply
-                if data.  startswith("reply_") and from_id == ADMIN_ID:   
-                    try:
-                        user_id = int(data.split("_", 1)[1])
-                    except Exception as e:
-                        logger.  error(f"Error parsing user_id:   {e}")
-                        return "ok", 200
-                    active_chats[user_id] = "active"
-                    admin_targets[from_id] = user_id
-                    edit_message(chat_id, message_id, message.  get("text", ""), reply_markup=None)
-                    send_message(from_id, f"Спілкуєтесь з користувачем {user_id}\nТип 'завершити' для закриття", parse_mode="HTML", reply_markup=admin_chat_markup())
-                    send_message(user_id, CHAT_START_TEXT, reply_markup=user_finish_markup(), parse_mode="HTML")
-                    return "ok", 200
+            # НОВОЕ: админ выбрал категорию — подтверждаем и сохраняем
+            elif data.startswith("confirm_addstat|") and chat_id == ADMIN_ID:
+                try:
+                    parts = data.split("|")
+                    if len(parts) == 4:
+                        orig_chat_id = int(parts[1])
+                        orig_msg_id = int(parts[2])
+                        cat_idx = int(parts[3])
+                        if 0 <= cat_idx < len(ADMIN_SUBCATEGORIES):
+                            category = ADMIN_SUBCATEGORIES[cat_idx]
+                            save_event(category)
+                            send_message(ADMIN_ID, f"✅ Повідомлення додано до статистики як: <b>{escape(category)}</b>", parse_mode="HTML", reply_markup=get_reply_buttons())
+                            if NOTIFY_USER_ON_ADD_STAT:
+                                try:
+                                    send_message(orig_chat_id, f"ℹ️ Ваше повідомлення було додано до статистики як: <b>{escape(category)}</b>", parse_mode="HTML")
+                                except Exception as e:
+                                    MainProtokol(str(e), 'notify_user_add_stat_err')
+                        else:
+                            send_message(ADMIN_ID, "Невірний індекс категорії.")
+                    else:
+                        send_message(ADMIN_ID, "Невірний формат callback confirm_addstat.")
+                except Exception as e:
+                    cool_error_handler(e, context="webhook: confirm_addstat callback")
+                    MainProtokol(str(e), 'confirm_addstat_callback_err')
 
-                # Admin close chat
-                if data. startswith("close_") and from_id == ADMIN_ID: 
-                    try:  
-                        user_id = int(data.split("_", 1)[1])
-                    except Exception as e:
-                        logger.error(f"Error parsing user_id:  {e}")
-                        return "ok", 200
-                    active_chats.pop(user_id, None)
-                    if admin_targets.get(from_id) == user_id:
-                        admin_targets.pop(from_id, None)
-                    send_message(user_id, CHAT_CLOSED_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-                    send_message(from_id, ADMIN_CHAT_CLOSED_TEXT % user_id, parse_mode="HTML")
-                    send_message(from_id, WELCOME_TEXT, reply_markup=main_menu_markup(), parse_mode="HTML")
-                    log_admin_communication("admin", user_id, "Чат завершен админом (по кнопке)")
-                    return "ok", 200
-
-                return "ok", 200
-
-            # message handling
-            msg = update.get("message")
-            if not msg:
-                logger.warning("[WEBHOOK] Немає message")
-                return "ok", 200
-
-            chat_id = msg. get("chat", {}).get("id")
-            user_id = msg.get("from", {}).get("id")
-            text = msg.get("text", "") or ""
-
-            logger.info(f"[WEBHOOK] chat_id={chat_id}, text='{text}'")
-
-            command = None
-            for possible in ("/start", "🏠 Меню", "📅 Графік", "❓ FAQ", "💳 Реквізити", "📞 Поставити питання", "✓ Завершити", "✓ Завершити чат", "🏠 До меню"):
-                if text.  startswith(possible) or text == possible:
-                    command = text.  strip()
-                    logger.info(f"[WEBHOOK] Команда: {command}")
-                    break
-
-            if command:   
-                threading.Thread(target=handle_command, args=(command, chat_id, msg, user_id), daemon=True).start()
-                return "ok", 200
-
-            if chat_id in active_chats and active_chats[chat_id] == "active" and user_id != ADMIN_ID:
-                if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
-                    send_media(ADMIN_ID, msg)
-                    send_message(ADMIN_ID, f"Медіа від {chat_id}", parse_mode="HTML", reply_markup=admin_reply_markup(chat_id))
-                    log_admin_communication("user", chat_id, "[Медіа]")
-                elif text:     
-                    send_message(ADMIN_ID, f"<b>{chat_id}:</b>\n{text}", parse_mode="HTML", reply_markup=admin_reply_markup(chat_id))
-                    log_admin_communication("user", chat_id, text)
-                return "ok", 200
-
-            if chat_id == ADMIN_ID:    
-                target = admin_targets.get(ADMIN_ID)
-                if target:
-                    if any(k in msg for k in ("photo", "document", "video", "audio", "voice")):
-                        send_media(target, msg)
-                        send_message(target, "Адміністратор надіслав медіа", reply_markup=user_finish_markup(), parse_mode="HTML")
-                        log_admin_communication("admin", target, "[Медіа]")
-                    elif text:
-                        send_message(target, text, reply_markup=user_finish_markup(), parse_mode="HTML")
-                        log_admin_communication("admin", target, text)
-                    return "ok", 200
-
+            else:
+                # другие callback'ы
+                if data == "about":
+                    # Подробная информация о компании (отправляется как HTML с кликабельной ссылкой на Instagram)
+                    send_message(chat_id, ABOUT_COMPANY_DETAILED, parse_mode="HTML", reply_markup=get_reply_buttons())
+                elif data == "schedule":
+                    send_message(
+                        chat_id,
+                        "Наш бот приймає повідомлення 24/7. Ми відповідаємо якнайшвидше."
+                    )
+                elif data == "write_admin":
+                    with GLOBAL_LOCK:
+                        waiting_for_admin_message.add(chat_id)
+                    send_message(
+                        chat_id,
+                        "✍️ Напишіть повідомлення адміністратору (текст/фото/документ):"
+                    )
             return "ok", 200
 
-        except Exception as e:
-            logger.  error(f"[WEBHOOK ERROR] {e}", exc_info=True)
-            return "error", 500
+        # MESSAGE HANDLING
+        if 'message' in update:
+            message = update['message']
+            # guard: ensure expected fields exist
+            chat = message.get('chat') or {}
+            frm = message.get('from') or {}
+            chat_id = chat.get('id')
+            from_id = frm.get('id')
+            text = message.get('text', '')
 
-@app.route("/", methods=["GET"])
-def index():
-    return "✅ Бот запущен", 200
+            # ---- ПАКЕТНЫЙ РЕЖИМ СОБОРА МЕДИА/ТЕКСТА ----
+            with GLOBAL_LOCK:
+                in_pending = chat_id in pending_mode if chat_id is not None else False
+            if in_pending:
+                if text == "✅ Надіслати":
+                    send_compiled_media_to_admin(chat_id)
+                    send_message(chat_id, "✅ Ваші дані відправлено. Дякуємо!", reply_markup=get_reply_buttons())
+                    return "ok", 200
+                elif text == "❌ Скасувати":
+                    with GLOBAL_LOCK:
+                        pending_media.pop(chat_id, None)
+                        pending_mode.pop(chat_id, None)
+                    send_message(chat_id, "❌ Скасовано.", reply_markup=get_reply_buttons())
+                    return "ok", 200
+                else:
+                    with GLOBAL_LOCK:
+                        pending_media.setdefault(chat_id, []).append(message)
+                    send_message(chat_id, "Додано до пакету. Продовжуйте надсилати або натисніть ✅ Надіслати.", reply_markup={
+                        "keyboard": [[{"text": "✅ Надіслати"}, {"text": "❌ Скасувати"}]],
+                        "resize_keyboard": True,
+                        "one_time_keyboard": False
+                    })
+                    return "ok", 200
 
-if __name__ == "__main__":     
-    start_idle_mode()
-    register_webhook()
-    port = int(os.getenv("PORT", "5000"))
-    try:
-        app.run("0.0.0.0", port=port, threaded=True)
+            # ---- НОВОЕ: если админ сейчас в режиме добавления события, собираем его сообщения ----
+            with GLOBAL_LOCK:
+                admin_flow = admin_adding_event.get(from_id)
+            if admin_flow:
+                if text == "✅ Підтвердити":
+                    with GLOBAL_LOCK:
+                        flow = admin_adding_event.pop(from_id, None)
+                    if flow:
+                        category = flow.get("category")
+                        msgs = flow.get("messages", [])
+                        try:
+                            save_event(category)
+                        except Exception as e:
+                            cool_error_handler(e, "save_event (admin add)")
+                            send_message(ADMIN_ID, "❌ Помилка при збереженні події в БД.")
+                            return "ok", 200
+                        media_items, doc_msgs, leftover_texts = _collect_media_summary_and_payloads(msgs)
+                        cnt_photos = sum(1 for m in media_items if m["type"] == "photo")
+                        cnt_videos = sum(1 for m in media_items if m["type"] == "video")
+                        cnt_animations = sum(1 for m in media_items if m["type"] == "animation")
+                        cnt_docs = len(doc_msgs)
+                        cnt_texts = len(leftover_texts)
+                        summary_lines = [
+                            "<b>✅ Подія додана</b>",
+                            f"<b>Категорія:</b> {escape(str(category))}",
+                            f"<b>Фото:</b> {cnt_photos}",
+                            f"<b>Відео:</b> {cnt_videos}",
+                            f"<b>Анімації:</b> {cnt_animations}",
+                            f"<b>Документи:</b> {cnt_docs}",
+                            f"<b>Тексти:</b> {cnt_texts}",
+                        ]
+                        send_message(ADMIN_ID, "\n".join(summary_lines), parse_mode="HTML", reply_markup=get_reply_buttons())
+                        return "ok", 200
+                    else:
+                        send_message(ADMIN_ID, "Нема активного флоу додавання події.")
+                        return "ok", 200
+                elif text == "❌ Відмінити":
+                    with GLOBAL_LOCK:
+                        admin_adding_event.pop(from_id, None)
+                    send_message(ADMIN_ID, "❌ Додавання події скасовано.", reply_markup=get_reply_buttons())
+                    return "ok", 200
+                else:
+                    with GLOBAL_LOCK:
+                        admin_adding_event.setdefault(from_id, {"category": admin_flow["category"], "messages": []})
+                        admin_adding_event[from_id]["messages"].append(message)
+                    send_message(ADMIN_ID, "Додано до події. Продовжуйте надсилати матеріали або натисніть ✅ Підтвердити / ❌ Відмінити", reply_markup=get_reply_buttons())
+                    return "ok", 200
+
+            # Ответ администратора пользователю (теперь поддерживает медиа)
+            with GLOBAL_LOCK:
+                waiting_user = waiting_for_admin.get(ADMIN_ID)
+            if from_id == ADMIN_ID and waiting_user:
+                user_to_send = None
+                with GLOBAL_LOCK:
+                    user_to_send = waiting_for_admin.pop(ADMIN_ID, None)
+                success = False
+                if user_to_send:
+                    success = forward_admin_message_to_user(user_to_send, message)
+                if success:
+                    send_message(ADMIN_ID, f"✅ Повідомлення надіслано користувачу {user_to_send}.", reply_markup=get_reply_buttons())
+                else:
+                    send_message(ADMIN_ID, f"❌ Не вдалося надіслати повідомлення користувачу {user_to_send}.", reply_markup=get_reply_buttons())
+                return "ok", 200
+
+            # Главное меню и команда /add_event (для админа)
+            if text == '/start':
+                send_chat_action(chat_id, 'typing')
+                time.sleep(0.25)
+                user = message.get('from', {})
+                welcome = build_welcome_message(user)
+                send_message(
+                    chat_id,
+                    welcome,
+                    reply_markup=get_reply_buttons(),
+                    parse_mode='HTML'
+                )
+            elif text == '/add_event' and from_id == ADMIN_ID:
+                kb = {"inline_keyboard": []}
+                row = []
+                for idx, cat in enumerate(ADMIN_SUBCATEGORIES):
+                    row.append({"text": cat, "callback_data": f"admin_add_event|{idx}"})
+                    if len(row) == 2:
+                        kb["inline_keyboard"].append(row)
+                        row = []
+                if row:
+                    kb["inline_keyboard"].append(row)
+                send_message(ADMIN_ID, "Оберіть категорію для нової події:", reply_markup=kb)
+            elif text in MAIN_MENU:
+                if text == "✨ Головне":
+                    send_message(chat_id, "✨ Ви в головному меню.", reply_markup=get_reply_buttons())
+                elif text == "📢 Про нас":
+                    # Отправляем детальный раздел "Про компанію"
+                    send_message(chat_id, ABOUT_COMPANY_DETAILED, parse_mode="HTML", reply_markup=get_reply_buttons())
+                elif text == "🕰️ Графік роботи":
+                    send_message(
+                        chat_id,
+                        "Ми працюємо цілодобово. Звертайтесь у будь-який час.",
+                        reply_markup=get_reply_buttons()
+                    )
+                elif text == "📝 Повідомити про подію":
+                    # Пропускаем шаг выбора категории и сразу переводим пользователя в режим отправки медиа
+                    with GLOBAL_LOCK:
+                        user_admin_category[chat_id] = "Без категорії"
+                        pending_mode[chat_id] = "event"
+                        pending_media[chat_id] = []
+                    send_media_collection_keyboard(chat_id)
+                elif text == "📊 Статистика подій":
+                    stats = get_stats()
+                    if stats:
+                        msg = format_stats_message(stats)
+                        send_message(chat_id, msg, parse_mode='HTML')
+                    else:
+                        send_message(chat_id, "Наразі статистика недоступна.")
+                elif text == "📣 Реклама 🔔":
+                    # обработчик обновлён под новую визуальную метку кнопки "Реклама"
+                    with GLOBAL_LOCK:
+                        pending_mode[chat_id] = "ad"
+                        pending_media[chat_id] = []
+                    send_media_collection_keyboard(chat_id)
+            elif text in ADMIN_SUBCATEGORIES:
+                with GLOBAL_LOCK:
+                    user_admin_category[chat_id] = text
+                    pending_mode[chat_id] = "event"
+                    pending_media[chat_id] = []
+                send_media_collection_keyboard(chat_id)
+
+            else:
+                # По умолчанию — если пришло сообщение от пользователя (не админа), отправляем карточку админу
+                if from_id != ADMIN_ID:
+                    orig_chat_id = chat_id
+                    orig_msg_id = message.get('message_id')
+                    # default (one-shot) messages considered generic 'message' type
+                    admin_info = build_admin_info(message, msg_type="message")
+                    orig_user_id = message.get('from', {}).get('id')
+                    reply_markup = _get_reply_markup_for_admin(orig_user_id, orig_chat_id, orig_msg_id)
+                    send_message(ADMIN_ID, admin_info, reply_markup=reply_markup, parse_mode="HTML")
+                    send_message(chat_id, "Дякуємо! Ваше повідомлення отримано — наш адміністратор перевірить його.", reply_markup=get_reply_buttons())
+
+        return "ok", 200
+
     except Exception as e:
-        logger.error(f"Error running app: {e}")
-    finally:
-        stop_idle_mode()
-        delete_webhook()
+        cool_error_handler(e, context="webhook - outer")
+        MainProtokol(str(e), 'Помилка webhook')
+        return "ok", 200
+
+@app.route('/', methods=['GET'])
+def index():
+    try:
+        MainProtokol('Відвідання сайту')
+        return "Бот працює", 200
+    except Exception as e:
+        cool_error_handler(e, context="index route")
+        return "Error", 500
+
+if __name__ == "__main__":
+    try:
+        threading.Thread(target=time_debugger, daemon=True).start()
+    except Exception as e:
+        cool_error_handler(e, context="main: start time_debugger")
+    try:
+        threading.Thread(target=stats_autoclear_daemon, daemon=True).start()
+    except Exception as e:
+        cool_error_handler(e, context="main: start stats_autoclear_daemon")
+    port = int(os.getenv("PORT", 5000))
+    try:
+        app.run(host="0.0.0.0", port=port)
+    except Exception as e:
+        cool_error_handler(e, context="main: app.run")
